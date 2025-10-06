@@ -12,17 +12,12 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 1100;
 
-// Vercel-compatible paths
-const __dirname = path.resolve();
-const dbPath = process.env.NODE_ENV === 'production' ? '/tmp/database.db' : './database.db';
-const SYSTEM_PROMPTS_DIR = process.env.NODE_ENV === 'production' ? '/tmp/system-prompts' : './system-prompts';
-
-// Configuration
+// Configuration - UPDATED with correct SudoApp URL
 const CONFIG = {
     GROQ_API_KEY: process.env.GROQ_API_KEY || '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',
     SUDOAPP_API_KEY: process.env.SUDOAPP_API_KEY || '3fd5e44f6859749864550d7da6697cf1a392b83fb712e734e49d9eba118bb669',
     JWT_SECRET: process.env.JWT_SECRET || '32b635cb52cb2551b7e4019f92a09da8',
-    SUDOAPP_API_URL: 'https://sudoapp.dev/api/v1/chat/completions',
+    SUDOAPP_API_URL: 'https://sudoapp.dev/api/v1/chat/completions', // CORRECTED URL
     SEAART_API_URL: 'https://seaart-ai.apis-bj-devs.workers.dev'
 };
 
@@ -48,7 +43,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Database initialization
-const db = new sqlite3.Database(dbPath, (err) => {
+const db = new sqlite3.Database('./database.db', (err) => {
     if (err) {
         console.error('Error opening database:', err.message);
     } else {
@@ -59,6 +54,7 @@ const db = new sqlite3.Database(dbPath, (err) => {
 
 function initializeDatabase() {
     db.serialize(() => {
+        // Enhanced users table with banned status
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -70,7 +66,10 @@ function initializeDatabase() {
             banned_at DATETIME,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_login DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`);
+        )`, (err) => {
+            if (err) console.error('❌ Error creating users table:', err);
+            else console.log('✅ Users table ready');
+        });
 
         db.run(`CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +82,10 @@ function initializeDatabase() {
             tokens_used INTEGER,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
-        )`);
+        )`, (err) => {
+            if (err) console.error('❌ Error creating chat_history table:', err);
+            else console.log('✅ Chat history table ready');
+        });
 
         db.run(`CREATE TABLE IF NOT EXISTS user_preferences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,7 +95,10 @@ function initializeDatabase() {
             theme TEXT DEFAULT 'dark',
             language TEXT DEFAULT 'en',
             FOREIGN KEY(user_id) REFERENCES users(id)
-        )`);
+        )`, (err) => {
+            if (err) console.error('❌ Error creating user_preferences table:', err);
+            else console.log('✅ User preferences table ready');
+        });
 
         db.run(`CREATE TABLE IF NOT EXISTS custom_system_prompts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,73 +109,48 @@ function initializeDatabase() {
             is_public BOOLEAN DEFAULT FALSE,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
-        )`);
+        )`, (err) => {
+            if (err) console.error('❌ Error creating custom_system_prompts table:', err);
+            else console.log('✅ Custom system prompts table ready');
+        });
 
+        // Ban history table
         db.run(`CREATE TABLE IF NOT EXISTS ban_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             admin_id INTEGER,
-            action TEXT NOT NULL,
+            action TEXT NOT NULL, -- 'ban' or 'unban'
             reason TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(admin_id) REFERENCES users(id)
-        )`);
+        )`, (err) => {
+            if (err) console.error('❌ Error creating ban_history table:', err);
+            else console.log('✅ Ban history table ready');
+        });
     });
 }
 
 // System Prompts Management
+const SYSTEM_PROMPTS_DIR = './system-prompts';
 let systemPrompts = {};
 let promptCategories = {};
 
-function ensureDirectoryExists(dir) {
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-    }
-}
-
-function createFallbackPrompts() {
-    const fallbackPrompts = {
-        'coding-assistant.md': `You are an expert coding assistant. Help users with programming questions, code reviews, debugging, and learning programming concepts.`,
-        'writing-assistant.md': `You are a professional writing assistant. Help users with writing, editing, content creation, and communication.`,
-        'general-assistant.md': `You are a helpful AI assistant. Provide accurate, helpful, and friendly responses to user queries.`,
-        'math-tutor.md': `You are a math tutor. Help users understand mathematical concepts, solve problems, and explain step-by-step solutions.`,
-        'research-helper.md': `You are a research assistant. Help users find information, analyze data, and understand complex topics.`
-    };
-
-    Object.entries(fallbackPrompts).forEach(([filename, content]) => {
-        const filePath = path.join(SYSTEM_PROMPTS_DIR, filename);
-        if (!fs.existsSync(filePath)) {
-            fs.writeFileSync(filePath, content);
-        }
-    });
-}
-
 async function initializeSystemPrompts() {
     try {
-        ensureDirectoryExists(SYSTEM_PROMPTS_DIR);
-        
-        // Check if directory is empty or doesn't exist
-        if (!fs.existsSync(SYSTEM_PROMPTS_DIR) || fs.readdirSync(SYSTEM_PROMPTS_DIR).length === 0) {
+        if (!fs.existsSync(SYSTEM_PROMPTS_DIR)) {
             console.log('📥 Cloning system prompts repository...');
-            try {
-                await simpleGit().clone(
-                    'https://github.com/x1xhlol/system-prompts-and-models-of-ai-tools',
-                    SYSTEM_PROMPTS_DIR
-                );
-                console.log('✅ System prompts repository cloned successfully.');
-            } catch (cloneError) {
-                console.log('❌ Clone failed, using fallback prompts:', cloneError.message);
-                createFallbackPrompts();
-            }
+            await simpleGit().clone(
+                'https://github.com/x1xhlol/system-prompts-and-models-of-ai-tools',
+                SYSTEM_PROMPTS_DIR
+            );
+            console.log('✅ System prompts repository cloned successfully.');
         } else {
             console.log('✅ System prompts directory already exists');
         }
         loadAllPrompts();
     } catch (error) {
         console.error('❌ Error initializing system prompts:', error.message);
-        createFallbackPrompts();
-        loadAllPrompts();
     }
 }
 
@@ -178,7 +158,7 @@ function loadAllPrompts() {
     try {
         if (!fs.existsSync(SYSTEM_PROMPTS_DIR)) {
             console.log('❌ System prompts directory not found');
-            createFallbackPrompts();
+            return;
         }
 
         systemPrompts = {};
@@ -186,8 +166,6 @@ function loadAllPrompts() {
 
         function scanDirectory(dir, category = '') {
             try {
-                if (!fs.existsSync(dir)) return;
-                
                 const items = fs.readdirSync(dir);
                 
                 items.forEach(item => {
@@ -246,14 +224,6 @@ function loadAllPrompts() {
         }
 
         scanDirectory(SYSTEM_PROMPTS_DIR);
-        
-        // If no prompts were loaded, create fallback
-        if (Object.keys(systemPrompts).length === 0) {
-            console.log('⚠️ No prompts found, creating fallback prompts');
-            createFallbackPrompts();
-            scanDirectory(SYSTEM_PROMPTS_DIR);
-        }
-        
         console.log(`✅ Loaded ${Object.keys(systemPrompts).length} system prompts across ${Object.keys(promptCategories).length} categories`);
     } catch (error) {
         console.error('❌ Error loading system prompts:', error.message);
@@ -268,6 +238,7 @@ async function classifyPromptCategory(userPrompt) {
             return 'general';
         }
 
+        // Simple keyword-based classification as fallback
         const promptLower = userPrompt.toLowerCase();
         
         if (promptLower.includes('code') || promptLower.includes('program') || promptLower.includes('python') || promptLower.includes('javascript')) {
@@ -295,6 +266,7 @@ async function selectBestSystemPrompt(userPrompt, category) {
         const availablePrompts = promptCategories[category] || [];
         if (availablePrompts.length === 0) return null;
 
+        // Simple keyword matching
         const userPromptLower = userPrompt.toLowerCase();
         
         for (const promptPath of availablePrompts) {
@@ -323,7 +295,7 @@ async function selectBestSystemPrompt(userPrompt, category) {
     }
 }
 
-// Authentication Middleware
+// Authentication Middleware with ban check
 const authenticateToken = (req, res, next) => {
     try {
         const authHeader = req.headers['authorization'];
@@ -339,6 +311,7 @@ const authenticateToken = (req, res, next) => {
                 return res.status(403).json({ error: 'Invalid or expired token' });
             }
 
+            // Check if user is banned
             try {
                 const userRecord = await dbGet(
                     'SELECT banned, ban_reason FROM users WHERE id = ?',
@@ -427,8 +400,7 @@ app.get('/api/health', (req, res) => {
         categories: Object.keys(promptCategories).length,
         groq_available: groqAvailable,
         sudoapp_available: !!(CONFIG.SUDOAPP_API_KEY && CONFIG.SUDOAPP_API_KEY.length > 10),
-        database: 'connected',
-        environment: process.env.NODE_ENV || 'development'
+        database: 'connected'
     });
 });
 
@@ -511,6 +483,7 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
+        // Check if user is banned
         if (user.banned) {
             return res.status(403).json({ 
                 error: 'Account suspended',
@@ -563,6 +536,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Prompt is required' });
         }
 
+        // Check if user is banned (for authenticated users)
         if (req.user.role !== 'guest') {
             const user = await dbGet(
                 'SELECT banned FROM users WHERE id = ?',
@@ -577,11 +551,13 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             }
         }
 
+        // Auto model selection
         let selectedModel = model;
         if (model === 'auto') {
             selectedModel = groqAvailable ? 'groq' : 'sudoapp';
         }
 
+        // Model availability check
         if (selectedModel === 'groq' && !groqAvailable) {
             console.log('⚠️ Groq not available, switching to Sudoapp');
             selectedModel = 'sudoapp';
@@ -603,6 +579,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
         let selectedPromptInfo = null;
         let promptCategory = 'general';
 
+        // Smart prompt selection
         if (custom_system_prompt) {
             finalSystemPrompt = custom_system_prompt.substring(0, 1000);
             selectedPromptInfo = { type: 'custom', content: custom_system_prompt };
@@ -631,6 +608,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             }
         }
 
+        // Prepare messages
         const messages = [];
         if (finalSystemPrompt) {
             messages.push({ role: 'system', content: finalSystemPrompt });
@@ -661,6 +639,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             } catch (groqError) {
                 console.error('❌ Groq API error:', groqError.message);
                 
+                // Fallback to Sudoapp if Groq fails
                 if (CONFIG.SUDOAPP_API_KEY && CONFIG.SUDOAPP_API_KEY.length > 10) {
                     console.log('🔄 Groq failed, falling back to Sudoapp...');
                     usedFallback = true;
@@ -706,7 +685,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                         'Authorization': `Bearer ${CONFIG.SUDOAPP_API_KEY}`
                     },
                     body: JSON.stringify({
-                        model: 'gpt-4o',
+                        model: 'gpt-4o', // Using gpt-4o as per the example
                         messages: messages,
                         temperature: 0.7,
                         max_tokens: 1024
@@ -725,6 +704,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             } catch (sudoappError) {
                 console.error('❌ Sudoapp API error:', sudoappError);
                 
+                // Fallback to Groq if Sudoapp fails
                 if (groqAvailable) {
                     console.log('🔄 Sudoapp failed, falling back to Groq...');
                     usedFallback = true;
@@ -750,6 +730,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             }
         }
 
+        // Save to chat history for authenticated users
         if (req.user.role !== 'guest') {
             try {
                 await dbRun(
@@ -1044,7 +1025,7 @@ app.get('/api/system-prompts', authenticateToken, (req, res) => {
     }
 });
 
-// Admin Routes
+// Admin Routes with Ban/Unban Features
 app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const users = await dbAll(
@@ -1064,6 +1045,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
     }
 });
 
+// Ban user
 app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.id);
@@ -1086,11 +1068,13 @@ app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req
             return res.status(400).json({ error: 'User is already banned' });
         }
 
+        // Ban the user
         await dbRun(
             'UPDATE users SET banned = TRUE, ban_reason = ?, banned_at = CURRENT_TIMESTAMP WHERE id = ?',
             [reason || 'Violation of terms of service', userId]
         );
 
+        // Record ban history
         await dbRun(
             'INSERT INTO ban_history (user_id, admin_id, action, reason) VALUES (?, ?, ?, ?)',
             [userId, req.user.userId, 'ban', reason]
@@ -1111,6 +1095,7 @@ app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req
     }
 });
 
+// Unban user
 app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.id);
@@ -1128,11 +1113,13 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
             return res.status(400).json({ error: 'User is not banned' });
         }
 
+        // Unban the user
         await dbRun(
             'UPDATE users SET banned = FALSE, ban_reason = NULL, banned_at = NULL WHERE id = ?',
             [userId]
         );
 
+        // Record unban history
         await dbRun(
             'INSERT INTO ban_history (user_id, admin_id, action, reason) VALUES (?, ?, ?, ?)',
             [userId, req.user.userId, 'unban', 'Administrative action']
@@ -1152,6 +1139,7 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
     }
 });
 
+// Get ban history
 app.get('/api/admin/ban-history', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const history = await dbAll(`
@@ -1215,16 +1203,14 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
 app.get('/', (req, res) => {
     res.json({
         message: '🤖 Advanced AI Chatting Application Server',
-        version: '2.3.0',
+        version: '2.2.0',
         status: 'running',
-        environment: process.env.NODE_ENV || 'development',
         features: [
             'Smart Prompt Selection',
             'Guest Mode Support',
             'User Ban/Unban System',
             'Dual AI Provider Support',
-            'Auto Fallback Between AI Services',
-            'Vercel Optimized'
+            'Auto Fallback Between AI Services'
         ],
         endpoints: {
             auth: ['POST /api/register', 'POST /api/login'],
@@ -1265,8 +1251,6 @@ app.use((error, req, res, next) => {
 async function startServer() {
     try {
         console.log('🚀 Starting Advanced AI Chat Server...');
-        console.log(`📁 Database path: ${dbPath}`);
-        console.log(`📁 Prompts path: ${SYSTEM_PROMPTS_DIR}`);
         
         await initializeSystemPrompts();
         
@@ -1278,7 +1262,6 @@ async function startServer() {
             console.log(`📁 Categories available: ${Object.keys(promptCategories).length}`);
             console.log(`🤖 Groq AI: ${groqAvailable ? '✅ ENABLED' : '❌ DISABLED'}`);
             console.log(`🦊 Sudoapp AI: ${CONFIG.SUDOAPP_API_KEY && CONFIG.SUDOAPP_API_KEY.length > 10 ? '✅ ENABLED' : '❌ DISABLED'}`);
-            console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
             console.log('🔒 User Ban System: ✅ ENABLED');
             console.log('🔄 Auto Fallback: ✅ ENABLED');
             console.log('👥 Guest mode: ✅ ENABLED');
@@ -1304,6 +1287,3 @@ process.on('SIGINT', () => {
 });
 
 startServer();
-
-// Export for Vercel
-module.exports = app;
