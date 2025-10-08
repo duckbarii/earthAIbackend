@@ -8,17 +8,22 @@ const simpleGit = require('simple-git');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const textToSpeech = require('@google-cloud/text-to-speech'); // For TTS
 
 const app = express();
 const PORT = process.env.PORT || 1100;
 
-// Configuration - UPDATED with correct SudoApp URL
+// Configuration
 const CONFIG = {
     GROQ_API_KEY: process.env.GROQ_API_KEY || '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',
     SUDOAPP_API_KEY: process.env.SUDOAPP_API_KEY || '3fd5e44f6859749864550d7da6697cf1a392b83fb712e734e49d9eba118bb669',
     JWT_SECRET: process.env.JWT_SECRET || '32b635cb52cb2551b7e4019f92a09da8',
-    SUDOAPP_API_URL: 'https://sudoapp.dev/api/v1/chat/completions', // CORRECTED URL
-    SEAART_API_URL: 'https://seaart-ai.apis-bj-devs.workers.dev'
+    SUDOAPP_API_URL: 'https://sudoapp.dev/api/v1/chat/completions',
+    SEAART_API_URL: 'https://seaart-ai.apis-bj-devs.workers.dev',
+    // Pre-defined admin credentials
+    ADMIN_EMAIL: process.env.ADMIN_EMAIL || 'admin@aifromearth.com',
+    ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin123456',
+    ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'neuroadmin'
 };
 
 // Initialize Groq client
@@ -37,13 +42,56 @@ try {
     console.error('❌ Failed to initialize Groq client:', error.message);
 }
 
+// Enhanced CORS configuration
+const corsOptions = {
+    origin: function (origin, callback) {
+        if (!origin) return callback(null, true);
+        
+        const allowedOrigins = [
+            'https://dnnetwork.rf.gd',
+            'http://localhost:3000',
+            'http://127.0.0.1:3000',
+            'http://localhost:5500',
+            'http://127.0.0.1:5500'
+        ];
+        
+        if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+};
+
 // Middleware
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Handle preflight requests
+app.options('*', cors(corsOptions));
+
+// Security headers
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('X-Content-Type-Options', 'nosniff');
+    res.header('X-Frame-Options', 'DENY');
+    res.header('X-XSS-Protection', '1; mode=block');
+    
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    next();
+});
 
 // Database initialization
-const db = new sqlite3.Database('./database.db', (err) => {
+const db = new sqlite3.Database('./aifromearth.db', (err) => {
     if (err) {
         console.error('Error opening database:', err.message);
     } else {
@@ -52,83 +100,134 @@ const db = new sqlite3.Database('./database.db', (err) => {
     }
 });
 
-function initializeDatabase() {
-    db.serialize(() => {
-        // Enhanced users table with banned status
-        db.run(`CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            banned BOOLEAN DEFAULT FALSE,
-            ban_reason TEXT,
-            banned_at DATETIME,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_login DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`, (err) => {
-            if (err) console.error('❌ Error creating users table:', err);
-            else console.log('✅ Users table ready');
-        });
+async function initializeDatabase() {
+    return new Promise((resolve, reject) => {
+        db.serialize(() => {
+            // Enhanced users table with preferences
+            db.run(`CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                banned BOOLEAN DEFAULT FALSE,
+                ban_reason TEXT,
+                banned_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
+                tts_voice TEXT DEFAULT 'Arista-PlayAI',
+                theme TEXT DEFAULT 'dark',
+                language TEXT DEFAULT 'en'
+            )`, async (err) => {
+                if (err) console.error('❌ Error creating users table:', err);
+                else {
+                    console.log('✅ Users table ready');
+                    // Create default admin user
+                    await createAdminUser();
+                }
+            });
 
-        db.run(`CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            prompt TEXT NOT NULL,
-            response TEXT NOT NULL,
-            model_used TEXT,
-            system_prompt_used TEXT,
-            prompt_category TEXT,
-            tokens_used INTEGER,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )`, (err) => {
-            if (err) console.error('❌ Error creating chat_history table:', err);
-            else console.log('✅ Chat history table ready');
-        });
+            // Conversations table for chat sessions
+            db.run(`CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                title TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )`, (err) => {
+                if (err) console.error('❌ Error creating conversations table:', err);
+                else console.log('✅ Conversations table ready');
+            });
 
-        db.run(`CREATE TABLE IF NOT EXISTS user_preferences (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE,
-            default_model TEXT DEFAULT 'groq',
-            default_system_prompt TEXT,
-            theme TEXT DEFAULT 'dark',
-            language TEXT DEFAULT 'en',
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )`, (err) => {
-            if (err) console.error('❌ Error creating user_preferences table:', err);
-            else console.log('✅ User preferences table ready');
-        });
+            // Messages table for individual messages in conversations
+            db.run(`CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                model_used TEXT,
+                system_prompt_used TEXT,
+                prompt_category TEXT,
+                tokens_used INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+            )`, (err) => {
+                if (err) console.error('❌ Error creating messages table:', err);
+                else console.log('✅ Messages table ready');
+            });
 
-        db.run(`CREATE TABLE IF NOT EXISTS custom_system_prompts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT NOT NULL,
-            content TEXT NOT NULL,
-            category TEXT,
-            is_public BOOLEAN DEFAULT FALSE,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )`, (err) => {
-            if (err) console.error('❌ Error creating custom_system_prompts table:', err);
-            else console.log('✅ Custom system prompts table ready');
-        });
+            // User system prompts table
+            db.run(`CREATE TABLE IF NOT EXISTS user_system_prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                category TEXT DEFAULT 'general',
+                is_public BOOLEAN DEFAULT FALSE,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )`, (err) => {
+                if (err) console.error('❌ Error creating user_system_prompts table:', err);
+                else console.log('✅ User system prompts table ready');
+            });
 
-        // Ban history table
-        db.run(`CREATE TABLE IF NOT EXISTS ban_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            admin_id INTEGER,
-            action TEXT NOT NULL, -- 'ban' or 'unban'
-            reason TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(admin_id) REFERENCES users(id)
-        )`, (err) => {
-            if (err) console.error('❌ Error creating ban_history table:', err);
-            else console.log('✅ Ban history table ready');
+            // Ban history table
+            db.run(`CREATE TABLE IF NOT EXISTS ban_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                admin_id INTEGER,
+                action TEXT NOT NULL,
+                reason TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(admin_id) REFERENCES users(id)
+            )`, (err) => {
+                if (err) console.error('❌ Error creating ban_history table:', err);
+                else console.log('✅ Ban history table ready');
+            });
+
+            // User activity logs for security
+            db.run(`CREATE TABLE IF NOT EXISTS user_activity_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT,
+                details TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )`, (err) => {
+                if (err) console.error('❌ Error creating user_activity_logs table:', err);
+                else console.log('✅ User activity logs table ready');
+                resolve();
+            });
         });
     });
+}
+
+async function createAdminUser() {
+    try {
+        const adminExists = await dbGet(
+            'SELECT id FROM users WHERE username = ? OR email = ?',
+            [CONFIG.ADMIN_USERNAME, CONFIG.ADMIN_EMAIL]
+        );
+
+        if (!adminExists) {
+            const passwordHash = await bcrypt.hash(CONFIG.ADMIN_PASSWORD, 12);
+            await dbRun(
+                'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
+                [CONFIG.ADMIN_USERNAME, CONFIG.ADMIN_EMAIL, passwordHash, 'admin']
+            );
+            console.log('✅ Default admin user created');
+        } else {
+            console.log('✅ Admin user already exists');
+        }
+    } catch (error) {
+        console.error('❌ Error creating admin user:', error);
+    }
 }
 
 // System Prompts Management
@@ -142,22 +241,59 @@ async function initializeSystemPrompts() {
             console.log('📥 Cloning system prompts repository...');
             await simpleGit().clone(
                 'https://github.com/x1xhlol/system-prompts-and-models-of-ai-tools',
-                SYSTEM_PROMPTS_DIR
+                SYSTEM_PROMPTS_DIR,
+                ['--depth', '1']
             );
             console.log('✅ System prompts repository cloned successfully.');
         } else {
             console.log('✅ System prompts directory already exists');
+            // Update existing repository
+            try {
+                await simpleGit(SYSTEM_PROMPTS_DIR).pull();
+                console.log('✅ System prompts repository updated');
+            } catch (pullError) {
+                console.log('⚠️ Could not update system prompts repository:', pullError.message);
+            }
         }
         loadAllPrompts();
     } catch (error) {
         console.error('❌ Error initializing system prompts:', error.message);
+        // Create default prompts if repository fails
+        createDefaultSystemPrompts();
     }
+}
+
+function createDefaultSystemPrompts() {
+    console.log('📝 Creating default system prompts...');
+    systemPrompts = {
+        'general': {
+            content: 'You are a helpful, respectful, and honest assistant. Always answer as helpfully as possible.',
+            category: 'general',
+            filename: 'general.md'
+        },
+        'coding': {
+            content: 'You are an expert programming assistant. Help users with code, debugging, and technical questions.',
+            category: 'coding',
+            filename: 'coding.md'
+        },
+        'writing': {
+            content: 'You are a creative writing assistant. Help users with writing, editing, and creative projects.',
+            category: 'writing',
+            filename: 'writing.md'
+        }
+    };
+    promptCategories = {
+        'general': ['general'],
+        'coding': ['coding'],
+        'writing': ['writing']
+    };
 }
 
 function loadAllPrompts() {
     try {
         if (!fs.existsSync(SYSTEM_PROMPTS_DIR)) {
             console.log('❌ System prompts directory not found');
+            createDefaultSystemPrompts();
             return;
         }
 
@@ -227,6 +363,7 @@ function loadAllPrompts() {
         console.log(`✅ Loaded ${Object.keys(systemPrompts).length} system prompts across ${Object.keys(promptCategories).length} categories`);
     } catch (error) {
         console.error('❌ Error loading system prompts:', error.message);
+        createDefaultSystemPrompts();
     }
 }
 
@@ -238,20 +375,22 @@ async function classifyPromptCategory(userPrompt) {
             return 'general';
         }
 
-        // Simple keyword-based classification as fallback
         const promptLower = userPrompt.toLowerCase();
         
-        if (promptLower.includes('code') || promptLower.includes('program') || promptLower.includes('python') || promptLower.includes('javascript')) {
-            return 'coding' in promptCategories ? 'coding' : 'general';
-        }
-        if (promptLower.includes('write') || promptLower.includes('essay') || promptLower.includes('story')) {
-            return 'writing' in promptCategories ? 'writing' : 'general';
-        }
-        if (promptLower.includes('explain') || promptLower.includes('what is') || promptLower.includes('how does')) {
-            return 'explanation' in promptCategories ? 'explanation' : 'general';
-        }
-        if (promptLower.includes('math') || promptLower.includes('calculate') || promptLower.includes('solve')) {
-            return 'math' in promptCategories ? 'math' : 'general';
+        // Enhanced category detection
+        const categoryKeywords = {
+            'coding': ['code', 'program', 'python', 'javascript', 'java', 'c++', 'html', 'css', 'function', 'algorithm', 'debug', 'error'],
+            'writing': ['write', 'essay', 'story', 'article', 'blog', 'email', 'letter', 'creative', 'poem', 'novel'],
+            'explanation': ['explain', 'what is', 'how does', 'why', 'meaning', 'define', 'concept'],
+            'math': ['math', 'calculate', 'solve', 'equation', 'formula', 'statistics', 'probability'],
+            'research': ['research', 'study', 'paper', 'thesis', 'academic', 'scholarly'],
+            'business': ['business', 'marketing', 'strategy', 'plan', 'proposal', 'presentation']
+        };
+
+        for (const [category, keywords] of Object.entries(categoryKeywords)) {
+            if (keywords.some(keyword => promptLower.includes(keyword)) && promptCategories[category]) {
+                return category;
+            }
         }
 
         return 'general';
@@ -261,41 +400,121 @@ async function classifyPromptCategory(userPrompt) {
     }
 }
 
-async function selectBestSystemPrompt(userPrompt, category) {
+async function selectBestSystemPrompt(userPrompt, category, userId = null) {
     try {
-        const availablePrompts = promptCategories[category] || [];
-        if (availablePrompts.length === 0) return null;
-
-        // Simple keyword matching
-        const userPromptLower = userPrompt.toLowerCase();
+        let availablePrompts = promptCategories[category] || [];
         
+        // Add user's custom prompts for this category
+        if (userId) {
+            const userPrompts = await dbAll(
+                'SELECT name, content FROM user_system_prompts WHERE user_id = ? AND (category = ? OR category = "general") AND is_active = TRUE',
+                [userId, category]
+            );
+            
+            userPrompts.forEach((prompt, index) => {
+                const userPromptId = `user_${prompt.name}_${index}`;
+                systemPrompts[userPromptId] = {
+                    content: prompt.content,
+                    category: category,
+                    filename: prompt.name,
+                    isUserPrompt: true
+                };
+                availablePrompts.push(userPromptId);
+            });
+        }
+
+        if (availablePrompts.length === 0) {
+            // Fallback to general category
+            availablePrompts = promptCategories['general'] || [];
+            if (availablePrompts.length === 0) return null;
+        }
+
+        // Enhanced prompt selection with semantic matching
+        const userPromptLower = userPrompt.toLowerCase();
+        let bestMatch = null;
+        let bestScore = 0;
+
         for (const promptPath of availablePrompts) {
             const prompt = systemPrompts[promptPath];
+            let score = 0;
+
+            // Score based on filename/keyword matching
             const filenameLower = prompt.filename.toLowerCase();
             
-            if (userPromptLower.includes('code') && filenameLower.includes('code')) {
-                return prompt;
+            // Keyword scoring
+            const keywords = [
+                'code', 'program', 'developer', 'coding',
+                'write', 'writer', 'author', 'writing',
+                'explain', 'explanation', 'teacher',
+                'math', 'calculate', 'mathematics',
+                'creative', 'story', 'blog'
+            ];
+
+            keywords.forEach(keyword => {
+                if (userPromptLower.includes(keyword) && filenameLower.includes(keyword)) {
+                    score += 3;
+                } else if (userPromptLower.includes(keyword) || filenameLower.includes(keyword)) {
+                    score += 1;
+                }
+            });
+
+            // Prefer user prompts for better personalization
+            if (prompt.isUserPrompt) {
+                score += 2;
             }
-            if (userPromptLower.includes('write') && filenameLower.includes('writing')) {
-                return prompt;
-            }
-            if (userPromptLower.includes('explain') && filenameLower.includes('explanation')) {
-                return prompt;
-            }
-            if (userPromptLower.includes('math') && filenameLower.includes('math')) {
-                return prompt;
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = prompt;
             }
         }
-        
-        return systemPrompts[availablePrompts[0]];
+
+        return bestMatch || systemPrompts[availablePrompts[0]];
     } catch (error) {
         console.error('❌ Error selecting system prompt:', error.message);
-        const availablePrompts = promptCategories[category] || [];
+        const availablePrompts = promptCategories[category] || promptCategories['general'] || [];
         return availablePrompts.length > 0 ? systemPrompts[availablePrompts[0]] : null;
     }
 }
 
-// Authentication Middleware with ban check
+// Database utility functions
+function dbRun(query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.run(query, params, function(err) {
+            if (err) {
+                reject(err);
+            } else {
+                resolve({ changes: this.changes, lastID: this.lastID });
+            }
+        });
+    });
+}
+
+function dbGet(query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.get(query, params, (err, row) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(row);
+            }
+        });
+    });
+}
+
+function dbAll(query, params = []) {
+    return new Promise((resolve, reject) => {
+        db.all(query, params, (err, rows) => {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(rows);
+            }
+        });
+    });
+}
+
+// Authentication Middleware
 const authenticateToken = (req, res, next) => {
     try {
         const authHeader = req.headers['authorization'];
@@ -352,41 +571,16 @@ const requireAdmin = (req, res, next) => {
     next();
 };
 
-// Database utility functions
-function dbRun(query, params = []) {
-    return new Promise((resolve, reject) => {
-        db.run(query, params, function(err) {
-            if (err) {
-                reject(err);
-            } else {
-                resolve({ changes: this.changes, lastID: this.lastID });
-            }
-        });
-    });
-}
-
-function dbGet(query, params = []) {
-    return new Promise((resolve, reject) => {
-        db.get(query, params, (err, row) => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve(row);
-            }
-        });
-    });
-}
-
-function dbAll(query, params = []) {
-    return new Promise((resolve, reject) => {
-        db.all(query, params, (err, rows) => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve(rows);
-            }
-        });
-    });
+// Log user activity
+async function logUserActivity(userId, action, ipAddress, userAgent, details = null) {
+    try {
+        await dbRun(
+            'INSERT INTO user_activity_logs (user_id, action, ip_address, user_agent, details) VALUES (?, ?, ?, ?, ?)',
+            [userId, action, ipAddress, userAgent, details]
+        );
+    } catch (error) {
+        console.error('Error logging user activity:', error);
+    }
 }
 
 // API Routes
@@ -408,6 +602,8 @@ app.get('/api/health', (req, res) => {
 app.post('/api/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
+        const ipAddress = req.ip || req.connection.remoteAddress;
+        const userAgent = req.get('User-Agent');
 
         if (!username || !password) {
             return res.status(400).json({ error: 'Username and password are required' });
@@ -428,10 +624,8 @@ app.post('/api/register', async (req, res) => {
             [username, email || null, passwordHash]
         );
 
-        await dbRun(
-            'INSERT INTO user_preferences (user_id) VALUES (?)',
-            [result.lastID]
-        );
+        // Log registration activity
+        await logUserActivity(result.lastID, 'register', ipAddress, userAgent);
 
         const token = jwt.sign(
             { 
@@ -469,6 +663,8 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { username, password } = req.body;
+        const ipAddress = req.ip || req.connection.remoteAddress;
+        const userAgent = req.get('User-Agent');
 
         if (!username || !password) {
             return res.status(400).json({ error: 'Username and password are required' });
@@ -502,6 +698,9 @@ app.post('/api/login', async (req, res) => {
             [user.id]
         );
 
+        // Log login activity
+        await logUserActivity(user.id, 'login', ipAddress, userAgent);
+
         const token = jwt.sign(
             { 
                 userId: user.id, 
@@ -518,7 +717,10 @@ app.post('/api/login', async (req, res) => {
                 id: user.id,
                 username: user.username,
                 email: user.email,
-                role: user.role
+                role: user.role,
+                tts_voice: user.tts_voice,
+                theme: user.theme,
+                language: user.language
             }
         });
     } catch (error) {
@@ -527,10 +729,10 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Enhanced AI Chat with proper SudoApp integration
+// Enhanced AI Chat with Conversation Management
 app.post('/api/chat', authenticateToken, async (req, res) => {
     try {
-        const { prompt, model = 'auto', system_prompt_id, custom_system_prompt } = req.body;
+        const { prompt, conversation_id, system_prompt_id, custom_system_prompt } = req.body;
 
         if (!prompt || prompt.trim().length === 0) {
             return res.status(400).json({ error: 'Prompt is required' });
@@ -551,28 +753,24 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             }
         }
 
-        // Auto model selection
-        let selectedModel = model;
-        if (model === 'auto') {
-            selectedModel = groqAvailable ? 'groq' : 'sudoapp';
+        let conversationId = conversation_id;
+        
+        // Create new conversation if no conversation_id provided
+        if (!conversationId && req.user.role !== 'guest') {
+            const title = prompt.substring(0, 50) + (prompt.length > 50 ? '...' : '');
+            const convResult = await dbRun(
+                'INSERT INTO conversations (user_id, title) VALUES (?, ?)',
+                [req.user.userId, title]
+            );
+            conversationId = convResult.lastID;
         }
 
-        // Model availability check
-        if (selectedModel === 'groq' && !groqAvailable) {
-            console.log('⚠️ Groq not available, switching to Sudoapp');
-            selectedModel = 'sudoapp';
-        }
-
-        if (selectedModel === 'sudoapp' && (!CONFIG.SUDOAPP_API_KEY || CONFIG.SUDOAPP_API_KEY.length < 10)) {
-            if (groqAvailable) {
-                console.log('⚠️ Sudoapp not available, switching to Groq');
-                selectedModel = 'groq';
-            } else {
-                return res.status(400).json({ 
-                    error: 'No AI service available',
-                    details: 'Both Groq and Sudoapp are not configured properly'
-                });
-            }
+        // Add user message to conversation
+        if (conversationId && req.user.role !== 'guest') {
+            await dbRun(
+                'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)',
+                [conversationId, 'user', prompt]
+            );
         }
 
         let finalSystemPrompt = '';
@@ -581,11 +779,11 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
 
         // Smart prompt selection
         if (custom_system_prompt) {
-            finalSystemPrompt = custom_system_prompt.substring(0, 1000);
+            finalSystemPrompt = custom_system_prompt.substring(0, 2000);
             selectedPromptInfo = { type: 'custom', content: custom_system_prompt };
         } else if (system_prompt_id) {
             if (systemPrompts[system_prompt_id]) {
-                finalSystemPrompt = systemPrompts[system_prompt_id].content.substring(0, 1500);
+                finalSystemPrompt = systemPrompts[system_prompt_id].content.substring(0, 2000);
                 selectedPromptInfo = { 
                     type: 'repository', 
                     id: system_prompt_id,
@@ -596,11 +794,11 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             }
         } else {
             promptCategory = await classifyPromptCategory(prompt);
-            const bestPrompt = await selectBestSystemPrompt(prompt, promptCategory);
+            const bestPrompt = await selectBestSystemPrompt(prompt, promptCategory, req.user.userId);
             if (bestPrompt) {
-                finalSystemPrompt = bestPrompt.content.substring(0, 1500);
+                finalSystemPrompt = bestPrompt.content.substring(0, 2000);
                 selectedPromptInfo = { 
-                    type: 'auto_selected', 
+                    type: bestPrompt.isUserPrompt ? 'user_custom' : 'auto_selected', 
                     id: bestPrompt.path,
                     category: bestPrompt.category,
                     filename: bestPrompt.filename 
@@ -608,33 +806,55 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             }
         }
 
-        // Prepare messages
+        // Get conversation history for context
+        let conversationHistory = [];
+        if (conversationId && req.user.role !== 'guest') {
+            conversationHistory = await dbAll(
+                'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 10',
+                [conversationId]
+            );
+            conversationHistory.reverse(); // Oldest first
+        }
+
+        // Prepare messages with context
         const messages = [];
         if (finalSystemPrompt) {
             messages.push({ role: 'system', content: finalSystemPrompt });
         }
         
-        const userPrompt = prompt.length > 2000 ? prompt.substring(0, 2000) + '...' : prompt;
+        // Add conversation history (excluding current prompt)
+        conversationHistory.forEach(msg => {
+            if (msg.role === 'user' && msg.content !== prompt) {
+                messages.push({ role: 'user', content: msg.content });
+            } else if (msg.role === 'ai') {
+                messages.push({ role: 'assistant', content: msg.content });
+            }
+        });
+        
+        const userPrompt = prompt.length > 4000 ? prompt.substring(0, 4000) + '...' : prompt;
         messages.push({ role: 'user', content: userPrompt });
 
         let aiResponse;
         let tokensUsed = 0;
         let usedFallback = false;
+        let selectedModel = 'groq';
 
-        console.log(`🚀 Sending request to ${selectedModel} API...`);
+        console.log(`🚀 Sending request to AI API...`);
 
-        if (selectedModel === 'groq') {
+        // Try Groq first
+        if (groqAvailable) {
             try {
                 const completion = await groq.chat.completions.create({
                     messages: messages,
                     model: 'llama-3.1-8b-instant',
                     temperature: 0.7,
-                    max_tokens: 1024,
+                    max_tokens: 2048,
                     stream: false
                 });
 
                 aiResponse = completion.choices[0]?.message?.content || 'No response from AI';
                 tokensUsed = completion.usage?.total_tokens || 0;
+                selectedModel = 'groq';
                 console.log(`✅ Groq response received (${tokensUsed} tokens)`);
             } catch (groqError) {
                 console.error('❌ Groq API error:', groqError.message);
@@ -655,7 +875,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                                 model: 'gpt-4o',
                                 messages: messages,
                                 temperature: 0.7,
-                                max_tokens: 1024
+                                max_tokens: 2048
                             })
                         });
 
@@ -676,7 +896,8 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                     throw groqError;
                 }
             }
-        } else if (selectedModel === 'sudoapp') {
+        } else {
+            // Direct to Sudoapp if Groq not available
             try {
                 const response = await fetch(CONFIG.SUDOAPP_API_URL, {
                     method: 'POST',
@@ -685,10 +906,10 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                         'Authorization': `Bearer ${CONFIG.SUDOAPP_API_KEY}`
                     },
                     body: JSON.stringify({
-                        model: 'gpt-4o', // Using gpt-4o as per the example
+                        model: 'gpt-4o',
                         messages: messages,
                         temperature: 0.7,
-                        max_tokens: 1024
+                        max_tokens: 2048
                     })
                 });
 
@@ -700,56 +921,46 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                 const data = await response.json();
                 aiResponse = data.choices[0]?.message?.content || 'No response from AI';
                 tokensUsed = data.usage?.total_tokens || 0;
+                selectedModel = 'sudoapp';
                 console.log(`✅ Sudoapp response received (${tokensUsed} tokens)`);
             } catch (sudoappError) {
-                console.error('❌ Sudoapp API error:', sudoappError);
-                
-                // Fallback to Groq if Sudoapp fails
-                if (groqAvailable) {
-                    console.log('🔄 Sudoapp failed, falling back to Groq...');
-                    usedFallback = true;
-                    
-                    try {
-                        const completion = await groq.chat.completions.create({
-                            messages: messages,
-                            model: 'llama-3.1-8b-instant',
-                            temperature: 0.7,
-                            max_tokens: 1024
-                        });
-
-                        aiResponse = completion.choices[0]?.message?.content || 'No response from AI';
-                        tokensUsed = completion.usage?.total_tokens || 0;
-                        selectedModel = 'groq';
-                        console.log(`✅ Groq fallback response received (${tokensUsed} tokens)`);
-                    } catch (fallbackError) {
-                        throw new Error(`Both Sudoapp and Groq failed: ${fallbackError.message}`);
-                    }
-                } else {
-                    throw sudoappError;
-                }
+                throw new Error(`Sudoapp failed: ${sudoappError.message}`);
             }
         }
 
-        // Save to chat history for authenticated users
+        // Save AI response to conversation
+        if (conversationId && req.user.role !== 'guest') {
+            await dbRun(
+                `INSERT INTO messages 
+                (conversation_id, role, content, model_used, system_prompt_used, prompt_category, tokens_used) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    conversationId, 
+                    'ai', 
+                    aiResponse, 
+                    usedFallback ? `${selectedModel}_fallback` : selectedModel,
+                    selectedPromptInfo ? JSON.stringify(selectedPromptInfo) : null,
+                    promptCategory,
+                    tokensUsed
+                ]
+            );
+
+            // Update conversation timestamp
+            await dbRun(
+                'UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+                [conversationId]
+            );
+        }
+
+        // Log chat activity
         if (req.user.role !== 'guest') {
-            try {
-                await dbRun(
-                    `INSERT INTO chat_history 
-                    (user_id, prompt, response, model_used, system_prompt_used, prompt_category, tokens_used) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                    [
-                        req.user.userId, 
-                        prompt, 
-                        aiResponse, 
-                        usedFallback ? `${selectedModel}_fallback` : selectedModel,
-                        selectedPromptInfo ? JSON.stringify(selectedPromptInfo) : null,
-                        promptCategory,
-                        tokensUsed
-                    ]
-                );
-            } catch (dbError) {
-                console.error('❌ Error saving chat history:', dbError);
-            }
+            await logUserActivity(
+                req.user.userId, 
+                'chat_message', 
+                req.ip, 
+                req.get('User-Agent'),
+                `Category: ${promptCategory}, Tokens: ${tokensUsed}`
+            );
         }
 
         res.json({ 
@@ -759,6 +970,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             system_prompt_used: selectedPromptInfo,
             category: promptCategory,
             tokens_used: tokensUsed,
+            conversation_id: conversationId,
             success: true
         });
     } catch (error) {
@@ -771,7 +983,60 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
     }
 });
 
-// Image Generation
+// Text-to-Speech Endpoint
+app.post('/api/tts', authenticateToken, async (req, res) => {
+    try {
+        const { text, voice = 'Arista-PlayAI' } = req.body;
+
+        if (!text || text.trim().length === 0) {
+            return res.status(400).json({ error: 'Text is required for TTS' });
+        }
+
+        if (!groqAvailable) {
+            return res.status(500).json({ error: 'Groq TTS service not available' });
+        }
+
+        // Validate voice
+        const validVoices = [
+            'Arista-PlayAI', 'Atlas-PlayAI', 'Basil-PlayAI', 'Briggs-PlayAI', 
+            'Calum-PlayAI', 'Celeste-PlayAI', 'Cheyenne-PlayAI', 'Chip-PlayAI',
+            'Cillian-PlayAI', 'Deedee-PlayAI', 'Fritz-PlayAI', 'Gail-PlayAI',
+            'Indigo-PlayAI', 'Mamaw-PlayAI', 'Mason-PlayAI', 'Mikail-PlayAI',
+            'Mitch-PlayAI', 'Quinn-PlayAI', 'Thunder-PlayAI'
+        ];
+
+        const selectedVoice = validVoices.includes(voice) ? voice : 'Arista-PlayAI';
+
+        // Use Groq TTS
+        const ttsResponse = await groq.audio.speech.create({
+            model: "playai-tts",
+            voice: selectedVoice,
+            input: text.substring(0, 5000), // Limit text length
+            speed: 1.0,
+            response_format: "mp3"
+        });
+
+        // Convert response to buffer
+        const audioBuffer = Buffer.from(await ttsResponse.arrayBuffer());
+
+        res.set({
+            'Content-Type': 'audio/mpeg',
+            'Content-Length': audioBuffer.length,
+            'Content-Disposition': 'inline; filename="tts.mp3"'
+        });
+
+        res.send(audioBuffer);
+
+    } catch (error) {
+        console.error('❌ TTS error:', error);
+        res.status(500).json({ 
+            error: 'Failed to generate speech',
+            details: error.message
+        });
+    }
+});
+
+// Image Generation Endpoint - Fixed
 app.post('/api/generate-image', authenticateToken, async (req, res) => {
     try {
         const { prompt } = req.body;
@@ -780,12 +1045,21 @@ app.post('/api/generate-image', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Prompt is required' });
         }
 
-        const encodedPrompt = encodeURIComponent(prompt.substring(0, 500));
-        const imageUrl = `${CONFIG.SEAART_API_URL}/?Prompt=${encodedPrompt}`;
-
         console.log(`🎨 Generating image for prompt: ${prompt}`);
         
-        const response = await fetch(imageUrl);
+        const response = await fetch(CONFIG.SEAART_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                prompt: prompt.substring(0, 500),
+                width: 1024,
+                height: 1024,
+                steps: 20,
+                cfg_scale: 7.5
+            })
+        });
 
         if (!response.ok) {
             throw new Error(`SeaArt API error: ${response.status} ${response.statusText}`);
@@ -793,12 +1067,23 @@ app.post('/api/generate-image', authenticateToken, async (req, res) => {
 
         const data = await response.json();
         
-        if (!data.result || !Array.isArray(data.result)) {
+        if (!data.images || !Array.isArray(data.images)) {
             throw new Error('Invalid response format from SeaArt API');
         }
 
+        // Log image generation activity
+        if (req.user.role !== 'guest') {
+            await logUserActivity(
+                req.user.userId, 
+                'image_generation', 
+                req.ip, 
+                req.get('User-Agent'),
+                `Prompt: ${prompt.substring(0, 100)}`
+            );
+        }
+
         res.json({ 
-            images: data.result,
+            images: data.images,
             prompt: prompt,
             success: true
         });
@@ -812,50 +1097,162 @@ app.post('/api/generate-image', authenticateToken, async (req, res) => {
     }
 });
 
-// User Management Routes
-app.put('/api/user/change-password', authenticateToken, requireAuth, async (req, res) => {
+// Conversation Management
+app.get('/api/conversations', authenticateToken, requireAuth, async (req, res) => {
     try {
-        const { currentPassword, newPassword } = req.body;
-
-        if (!currentPassword || !newPassword) {
-            return res.status(400).json({ error: 'Current password and new password are required' });
-        }
-
-        if (newPassword.length < 6) {
-            return res.status(400).json({ error: 'New password must be at least 6 characters' });
-        }
-
-        const user = await dbGet(
-            'SELECT * FROM users WHERE id = ?',
+        const conversations = await dbAll(
+            `SELECT id, title, created_at, updated_at 
+             FROM conversations 
+             WHERE user_id = ? AND is_active = TRUE
+             ORDER BY updated_at DESC 
+             LIMIT 50`,
             [req.user.userId]
         );
 
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        const validPassword = await bcrypt.compare(currentPassword, user.password_hash);
-        if (!validPassword) {
-            return res.status(401).json({ error: 'Current password is incorrect' });
-        }
-
-        const newPasswordHash = await bcrypt.hash(newPassword, 10);
-
-        await dbRun(
-            'UPDATE users SET password_hash = ? WHERE id = ?',
-            [newPasswordHash, req.user.userId]
-        );
-
-        res.json({ message: 'Password changed successfully' });
+        res.json({ conversations });
     } catch (error) {
-        console.error('❌ Change password error:', error);
-        res.status(500).json({ error: 'Failed to change password' });
+        console.error('❌ Conversations fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch conversations' });
     }
 });
 
+app.get('/api/conversations/:id/messages', authenticateToken, requireAuth, async (req, res) => {
+    try {
+        const conversationId = req.params.id;
+        
+        // Verify conversation belongs to user
+        const conversation = await dbGet(
+            'SELECT id FROM conversations WHERE id = ? AND user_id = ?',
+            [conversationId, req.user.userId]
+        );
+
+        if (!conversation) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
+
+        const messages = await dbAll(
+            `SELECT role, content, model_used, tokens_used, created_at 
+             FROM messages 
+             WHERE conversation_id = ? 
+             ORDER BY created_at ASC`,
+            [conversationId]
+        );
+
+        res.json({ messages });
+    } catch (error) {
+        console.error('❌ Messages fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+});
+
+app.delete('/api/conversations/:id', authenticateToken, requireAuth, async (req, res) => {
+    try {
+        const conversationId = req.params.id;
+        
+        // Verify conversation belongs to user
+        const conversation = await dbGet(
+            'SELECT id FROM conversations WHERE id = ? AND user_id = ?',
+            [conversationId, req.user.userId]
+        );
+
+        if (!conversation) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
+
+        await dbRun(
+            'UPDATE conversations SET is_active = FALSE WHERE id = ?',
+            [conversationId]
+        );
+
+        res.json({ message: 'Conversation deleted successfully' });
+    } catch (error) {
+        console.error('❌ Conversation delete error:', error);
+        res.status(500).json({ error: 'Failed to delete conversation' });
+    }
+});
+
+// System Prompts Management
+app.post('/api/system-prompts', authenticateToken, requireAuth, async (req, res) => {
+    try {
+        const { name, content, category = 'general', is_public = false } = req.body;
+
+        if (!name || !content) {
+            return res.status(400).json({ error: 'Name and content are required' });
+        }
+
+        const result = await dbRun(
+            'INSERT INTO user_system_prompts (user_id, name, content, category, is_public) VALUES (?, ?, ?, ?, ?)',
+            [req.user.userId, name, content, category, is_public]
+        );
+
+        res.status(201).json({
+            message: 'System prompt created successfully',
+            prompt: {
+                id: result.lastID,
+                name,
+                content,
+                category,
+                is_public
+            }
+        });
+    } catch (error) {
+        console.error('❌ System prompt creation error:', error);
+        res.status(500).json({ error: 'Failed to create system prompt' });
+    }
+});
+
+app.get('/api/system-prompts', authenticateToken, requireAuth, async (req, res) => {
+    try {
+        const userPrompts = await dbAll(
+            'SELECT id, name, content, category, is_public, created_at FROM user_system_prompts WHERE user_id = ? AND is_active = TRUE ORDER BY created_at DESC',
+            [req.user.userId]
+        );
+
+        const publicPrompts = await dbAll(
+            'SELECT id, name, content, category, created_at FROM user_system_prompts WHERE is_public = TRUE AND is_active = TRUE AND user_id != ? ORDER BY created_at DESC',
+            [req.user.userId]
+        );
+
+        res.json({
+            user_prompts: userPrompts,
+            public_prompts: publicPrompts
+        });
+    } catch (error) {
+        console.error('❌ System prompts fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch system prompts' });
+    }
+});
+
+app.delete('/api/system-prompts/:id', authenticateToken, requireAuth, async (req, res) => {
+    try {
+        const promptId = req.params.id;
+        
+        // Verify prompt belongs to user
+        const prompt = await dbGet(
+            'SELECT id FROM user_system_prompts WHERE id = ? AND user_id = ?',
+            [promptId, req.user.userId]
+        );
+
+        if (!prompt) {
+            return res.status(404).json({ error: 'System prompt not found' });
+        }
+
+        await dbRun(
+            'UPDATE user_system_prompts SET is_active = FALSE WHERE id = ?',
+            [promptId]
+        );
+
+        res.json({ message: 'System prompt deleted successfully' });
+    } catch (error) {
+        console.error('❌ System prompt delete error:', error);
+        res.status(500).json({ error: 'Failed to delete system prompt' });
+    }
+});
+
+// User Profile Management
 app.put('/api/user/profile', authenticateToken, requireAuth, async (req, res) => {
     try {
-        const { username, email } = req.body;
+        const { username, email, tts_voice, theme, language } = req.body;
 
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
@@ -875,8 +1272,8 @@ app.put('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
         }
 
         await dbRun(
-            'UPDATE users SET username = ?, email = ? WHERE id = ?',
-            [username, email || null, req.user.userId]
+            'UPDATE users SET username = ?, email = ?, tts_voice = ?, theme = ?, language = ? WHERE id = ?',
+            [username, email || null, tts_voice, theme, language, req.user.userId]
         );
 
         res.json({ 
@@ -884,7 +1281,10 @@ app.put('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
             user: {
                 id: req.user.userId,
                 username: username,
-                email: email
+                email: email,
+                tts_voice: tts_voice,
+                theme: theme,
+                language: language
             }
         });
     } catch (error) {
@@ -900,9 +1300,8 @@ app.get('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
     try {
         const user = await dbGet(
             `SELECT u.id, u.username, u.email, u.role, u.banned, u.ban_reason, u.created_at, u.last_login,
-                    up.default_model, up.default_system_prompt, up.theme, up.language
+                    u.tts_voice, u.theme, u.language
              FROM users u 
-             LEFT JOIN user_preferences up ON u.id = up.user_id
              WHERE u.id = ?`,
             [req.user.userId]
         );
@@ -913,11 +1312,13 @@ app.get('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
 
         const stats = await dbGet(
             `SELECT 
-                COUNT(*) as total_chats,
-                SUM(tokens_used) as total_tokens,
-                COUNT(DISTINCT prompt_category) as categories_used
-             FROM chat_history 
-             WHERE user_id = ?`,
+                COUNT(DISTINCT c.id) as total_conversations,
+                COUNT(m.id) as total_messages,
+                SUM(m.tokens_used) as total_tokens,
+                COUNT(DISTINCT m.prompt_category) as categories_used
+             FROM conversations c
+             LEFT JOIN messages m ON c.id = m.conversation_id
+             WHERE c.user_id = ? AND c.is_active = TRUE`,
             [req.user.userId]
         );
 
@@ -930,15 +1331,12 @@ app.get('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
                 banned: user.banned,
                 ban_reason: user.ban_reason,
                 created_at: user.created_at,
-                last_login: user.last_login
-            },
-            preferences: {
-                default_model: user.default_model,
-                default_system_prompt: user.default_system_prompt,
+                last_login: user.last_login,
+                tts_voice: user.tts_voice,
                 theme: user.theme,
                 language: user.language
             },
-            stats: stats || { total_chats: 0, total_tokens: 0, categories_used: 0 }
+            stats: stats || { total_conversations: 0, total_messages: 0, total_tokens: 0, categories_used: 0 }
         });
     } catch (error) {
         console.error('❌ Get profile error:', error);
@@ -946,94 +1344,17 @@ app.get('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
     }
 });
 
-// Chat History Management
-app.get('/api/chat/history', authenticateToken, requireAuth, async (req, res) => {
-    try {
-        const { page = 1, limit = 50, category, model } = req.query;
-        const offset = (page - 1) * limit;
-
-        let whereClause = 'WHERE user_id = ?';
-        let params = [req.user.userId];
-
-        if (category) {
-            whereClause += ' AND prompt_category = ?';
-            params.push(category);
-        }
-
-        if (model) {
-            whereClause += ' AND model_used = ?';
-            params.push(model);
-        }
-
-        const history = await dbAll(
-            `SELECT id, prompt, response, model_used, system_prompt_used, prompt_category, tokens_used, timestamp 
-             FROM chat_history 
-             ${whereClause}
-             ORDER BY timestamp DESC 
-             LIMIT ? OFFSET ?`,
-            [...params, parseInt(limit), offset]
-        );
-
-        const total = await dbGet(
-            `SELECT COUNT(*) as count FROM chat_history ${whereClause}`,
-            params
-        );
-
-        const parsedHistory = history.map(item => ({
-            ...item,
-            system_prompt_used: item.system_prompt_used ? JSON.parse(item.system_prompt_used) : null
-        }));
-
-        res.json({
-            history: parsedHistory,
-            pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
-                total: total.count,
-                totalPages: Math.ceil(total.count / limit)
-            }
-        });
-    } catch (error) {
-        console.error('❌ Chat history error:', error);
-        res.status(500).json({ error: 'Failed to fetch chat history' });
-    }
-});
-
-// System Prompts Management
-app.get('/api/system-prompts', authenticateToken, (req, res) => {
-    try {
-        const categories = Object.keys(promptCategories).map(category => ({
-            name: category,
-            prompt_count: promptCategories[category].length,
-            prompts: promptCategories[category].map(promptPath => ({
-                id: promptPath,
-                filename: systemPrompts[promptPath].filename,
-                category: systemPrompts[promptPath].category,
-                preview: systemPrompts[promptPath].content.substring(0, 150) + '...',
-                full_path: promptPath
-            }))
-        }));
-
-        res.json({
-            total_prompts: Object.keys(systemPrompts).length,
-            total_categories: categories.length,
-            categories: categories
-        });
-    } catch (error) {
-        console.error('❌ System prompts fetch error:', error);
-        res.status(500).json({ error: 'Failed to fetch system prompts' });
-    }
-});
-
-// Admin Routes with Ban/Unban Features
+// Admin Routes
 app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const users = await dbAll(
             `SELECT u.id, u.username, u.email, u.role, u.banned, u.ban_reason, u.banned_at, u.created_at, u.last_login,
-                    COUNT(ch.id) as chat_count, 
-                    SUM(ch.tokens_used) as total_tokens
+                    COUNT(DISTINCT c.id) as conversation_count, 
+                    COUNT(m.id) as message_count,
+                    SUM(m.tokens_used) as total_tokens
              FROM users u
-             LEFT JOIN chat_history ch ON u.id = ch.user_id
+             LEFT JOIN conversations c ON u.id = c.user_id AND c.is_active = TRUE
+             LEFT JOIN messages m ON c.id = m.conversation_id
              GROUP BY u.id
              ORDER BY u.created_at DESC`
         );
@@ -1045,7 +1366,60 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
     }
 });
 
-// Ban user
+app.get('/api/admin/user/:id/details', authenticateToken, requireAdmin, async (req, res) => {
+    try {
+        const userId = req.params.id;
+
+        const user = await dbGet(
+            `SELECT u.*, 
+                    COUNT(DISTINCT c.id) as conversation_count,
+                    COUNT(m.id) as message_count,
+                    SUM(m.tokens_used) as total_tokens
+             FROM users u
+             LEFT JOIN conversations c ON u.id = c.user_id AND c.is_active = TRUE
+             LEFT JOIN messages m ON c.id = m.conversation_id
+             WHERE u.id = ?
+             GROUP BY u.id`,
+            [userId]
+        );
+
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const conversations = await dbAll(
+            `SELECT c.id, c.title, c.created_at, c.updated_at,
+                    COUNT(m.id) as message_count,
+                    SUM(m.tokens_used) as tokens_used
+             FROM conversations c
+             LEFT JOIN messages m ON c.id = m.conversation_id
+             WHERE c.user_id = ? AND c.is_active = TRUE
+             GROUP BY c.id
+             ORDER BY c.updated_at DESC
+             LIMIT 20`,
+            [userId]
+        );
+
+        const activityLogs = await dbAll(
+            `SELECT action, ip_address, user_agent, details, created_at
+             FROM user_activity_logs
+             WHERE user_id = ?
+             ORDER BY created_at DESC
+             LIMIT 50`,
+            [userId]
+        );
+
+        res.json({
+            user,
+            conversations,
+            activity_logs: activityLogs
+        });
+    } catch (error) {
+        console.error('❌ Admin user details error:', error);
+        res.status(500).json({ error: 'Failed to fetch user details' });
+    }
+});
+
 app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.id);
@@ -1080,6 +1454,15 @@ app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req
             [userId, req.user.userId, 'ban', reason]
         );
 
+        // Log admin action
+        await logUserActivity(
+            req.user.userId, 
+            'ban_user', 
+            req.ip, 
+            req.get('User-Agent'),
+            `Banned user: ${user.username}, Reason: ${reason}`
+        );
+
         res.json({ 
             message: 'User banned successfully',
             user: {
@@ -1095,7 +1478,6 @@ app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req
     }
 });
 
-// Unban user
 app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.id);
@@ -1125,6 +1507,15 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
             [userId, req.user.userId, 'unban', 'Administrative action']
         );
 
+        // Log admin action
+        await logUserActivity(
+            req.user.userId, 
+            'unban_user', 
+            req.ip, 
+            req.get('User-Agent'),
+            `Unbanned user: ${user.username}`
+        );
+
         res.json({ 
             message: 'User unbanned successfully',
             user: {
@@ -1139,39 +1530,24 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
     }
 });
 
-// Get ban history
-app.get('/api/admin/ban-history', authenticateToken, requireAdmin, async (req, res) => {
-    try {
-        const history = await dbAll(`
-            SELECT bh.*, u.username as user_username, a.username as admin_username
-            FROM ban_history bh
-            JOIN users u ON bh.user_id = u.id
-            JOIN users a ON bh.admin_id = a.id
-            ORDER BY bh.created_at DESC
-        `);
-
-        res.json({ history });
-    } catch (error) {
-        console.error('❌ Ban history fetch error:', error);
-        res.status(500).json({ error: 'Failed to fetch ban history' });
-    }
-});
-
 app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
     try {
         const totalUsers = await dbGet('SELECT COUNT(*) as count FROM users');
         const bannedUsers = await dbGet('SELECT COUNT(*) as count FROM users WHERE banned = TRUE');
-        const totalChats = await dbGet('SELECT COUNT(*) as count FROM chat_history');
-        const totalTokens = await dbGet('SELECT SUM(tokens_used) as count FROM chat_history');
+        const totalConversations = await dbGet('SELECT COUNT(*) as count FROM conversations WHERE is_active = TRUE');
+        const totalMessages = await dbGet('SELECT COUNT(*) as count FROM messages');
+        const totalTokens = await dbGet('SELECT SUM(tokens_used) as count FROM messages');
+        
         const activeUsers = await dbGet(`
             SELECT COUNT(DISTINCT user_id) as count 
-            FROM chat_history 
-            WHERE timestamp > datetime('now', '-7 days')
+            FROM user_activity_logs 
+            WHERE created_at > datetime('now', '-7 days')
         `);
 
         const popularCategories = await dbAll(`
             SELECT prompt_category, COUNT(*) as usage_count
-            FROM chat_history 
+            FROM messages 
+            WHERE prompt_category IS NOT NULL
             GROUP BY prompt_category 
             ORDER BY usage_count DESC 
             LIMIT 10
@@ -1179,19 +1555,30 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
 
         const modelUsage = await dbAll(`
             SELECT model_used, COUNT(*) as usage_count
-            FROM chat_history 
+            FROM messages 
+            WHERE model_used IS NOT NULL
             GROUP BY model_used 
             ORDER BY usage_count DESC
+        `);
+
+        const recentActivity = await dbAll(`
+            SELECT u.username, ual.action, ual.details, ual.created_at
+            FROM user_activity_logs ual
+            JOIN users u ON ual.user_id = u.id
+            ORDER BY ual.created_at DESC
+            LIMIT 20
         `);
 
         res.json({
             totalUsers: totalUsers.count,
             bannedUsers: bannedUsers.count,
-            totalChats: totalChats.count,
+            totalConversations: totalConversations.count,
+            totalMessages: totalMessages.count,
             totalTokens: totalTokens.count || 0,
             activeUsers: activeUsers.count,
             popularCategories: popularCategories,
-            modelUsage: modelUsage
+            modelUsage: modelUsage,
+            recentActivity: recentActivity
         });
     } catch (error) {
         console.error('❌ Admin stats error:', error);
@@ -1202,33 +1589,43 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
-        message: '🤖 Advanced AI Chatting Application Server',
-        version: '2.2.0',
+        message: '🤖 aifromearth - Advanced AI Chatting Application Server',
+        version: '3.0.0',
         status: 'running',
         features: [
-            'Smart Prompt Selection',
-            'Guest Mode Support',
-            'User Ban/Unban System',
-            'Dual AI Provider Support',
-            'Auto Fallback Between AI Services'
+            'Smart Prompt Selection & Custom Prompts',
+            'Conversation Management',
+            'Text-to-Speech (TTS) Support',
+            'Image Generation',
+            'User Activity Logging',
+            'Admin Security Panel',
+            'Multi-AI Provider Fallback'
         ],
         endpoints: {
             auth: ['POST /api/register', 'POST /api/login'],
             user: [
                 'GET /api/user/profile',
-                'PUT /api/user/profile', 
-                'PUT /api/user/change-password'
+                'PUT /api/user/profile'
             ],
             chat: [
                 'POST /api/chat',
+                'GET /api/conversations',
+                'GET /api/conversations/:id/messages'
+            ],
+            ai_services: [
                 'POST /api/generate-image',
-                'GET /api/chat/history'
+                'POST /api/tts'
+            ],
+            system_prompts: [
+                'GET /api/system-prompts',
+                'POST /api/system-prompts',
+                'DELETE /api/system-prompts/:id'
             ],
             admin: [
                 'GET /api/admin/users',
+                'GET /api/admin/user/:id/details',
                 'POST /api/admin/users/:id/ban',
                 'POST /api/admin/users/:id/unban',
-                'GET /api/admin/ban-history',
                 'GET /api/admin/stats'
             ],
             health: ['GET /api/health']
@@ -1250,7 +1647,7 @@ app.use((error, req, res, next) => {
 // Initialize and start server
 async function startServer() {
     try {
-        console.log('🚀 Starting Advanced AI Chat Server...');
+        console.log('🚀 Starting Enhanced aifromearth Chat Server...');
         
         await initializeSystemPrompts();
         
@@ -1262,9 +1659,10 @@ async function startServer() {
             console.log(`📁 Categories available: ${Object.keys(promptCategories).length}`);
             console.log(`🤖 Groq AI: ${groqAvailable ? '✅ ENABLED' : '❌ DISABLED'}`);
             console.log(`🦊 Sudoapp AI: ${CONFIG.SUDOAPP_API_KEY && CONFIG.SUDOAPP_API_KEY.length > 10 ? '✅ ENABLED' : '❌ DISABLED'}`);
-            console.log('🔒 User Ban System: ✅ ENABLED');
-            console.log('🔄 Auto Fallback: ✅ ENABLED');
-            console.log('👥 Guest mode: ✅ ENABLED');
+            console.log(`🎤 TTS Service: ${groqAvailable ? '✅ ENABLED' : '❌ DISABLED'}`);
+            console.log(`🎨 Image Generation: ✅ ENABLED`);
+            console.log(`🔒 Admin Security: ✅ ENABLED`);
+            console.log(`📊 Activity Logging: ✅ ENABLED`);
             console.log('='.repeat(60));
         });
     } catch (error) {
