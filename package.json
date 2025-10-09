@@ -16,7 +16,8 @@
     "node-fetch": "^3.3.2",
     "groq-sdk": "^0.3.1",
     "simple-git": "^3.19.1",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "@google-cloud/text-to-speech": "^5.2.0"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -27,7 +28,9 @@
     "groq",
     "sudoapp",
     "backend",
-    "api"
+    "api",
+    "tts",
+    "google-cloud"
   ],
   "author": "Your Name",
   "license": "MIT"

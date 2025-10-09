@@ -8,7 +8,6 @@ const simpleGit = require('simple-git');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const textToSpeech = require('@google-cloud/text-to-speech'); // For TTS
 
 const app = express();
 const PORT = process.env.PORT || 1100;
@@ -18,10 +17,10 @@ const CONFIG = {
     GROQ_API_KEY: process.env.GROQ_API_KEY || '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',
     SUDOAPP_API_KEY: process.env.SUDOAPP_API_KEY || '3fd5e44f6859749864550d7da6697cf1a392b83fb712e734e49d9eba118bb669',
     JWT_SECRET: process.env.JWT_SECRET || '32b635cb52cb2551b7e4019f92a09da8',
-    SUDOAPP_API_URL: 'https://sudoapp.dev/api/v1/chat/completions',
-    SEAART_API_URL: 'https://seaart-ai.apis-bj-devs.workers.dev',
+    SUDOAPP_API_URL: 'https://api.sudoapp.xyz/v1/chat/completions',
+    SEAART_API_URL: 'https://api.seaart.ai/v1/image/generation',
     // Pre-defined admin credentials
-    ADMIN_EMAIL: process.env.ADMIN_EMAIL || 'admin@aifromearth.com',
+    ADMIN_EMAIL: process.env.ADMIN_EMAIL || 'admin@neuroai.com',
     ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || 'admin123456',
     ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'neuroadmin'
 };
@@ -31,7 +30,7 @@ let groq;
 let groqAvailable = false;
 
 try {
-    if (CONFIG.GROQ_API_KEY && CONFIG.GROQ_API_KEY.length > 50) {
+    if (CONFIG.GROQ_API_KEY && CONFIG.GROQ_API_KEY.startsWith('gsk_')) {
         groq = new Groq({ apiKey: CONFIG.GROQ_API_KEY });
         groqAvailable = true;
         console.log('✅ Groq client initialized successfully');
@@ -52,7 +51,9 @@ const corsOptions = {
             'http://localhost:3000',
             'http://127.0.0.1:3000',
             'http://localhost:5500',
-            'http://127.0.0.1:5500'
+            'http://127.0.0.1:5500',
+            'http://localhost:8080',
+            'http://127.0.0.1:8080'
         ];
         
         if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('localhost') || origin.includes('127.0.0.1')) {
@@ -91,7 +92,7 @@ app.use((req, res, next) => {
 });
 
 // Database initialization
-const db = new sqlite3.Database('./aifromearth.db', (err) => {
+const db = new sqlite3.Database('./neuroai.db', (err) => {
     if (err) {
         console.error('Error opening database:', err.message);
     } else {
@@ -100,7 +101,7 @@ const db = new sqlite3.Database('./aifromearth.db', (err) => {
     }
 });
 
-async function initializeDatabase() {
+function initializeDatabase() {
     return new Promise((resolve, reject) => {
         db.serialize(() => {
             // Enhanced users table with preferences
@@ -119,10 +120,11 @@ async function initializeDatabase() {
                 theme TEXT DEFAULT 'dark',
                 language TEXT DEFAULT 'en'
             )`, async (err) => {
-                if (err) console.error('❌ Error creating users table:', err);
-                else {
+                if (err) {
+                    console.error('❌ Error creating users table:', err);
+                    reject(err);
+                } else {
                     console.log('✅ Users table ready');
-                    // Create default admin user
                     await createAdminUser();
                 }
             });
@@ -201,33 +203,39 @@ async function initializeDatabase() {
                 FOREIGN KEY(user_id) REFERENCES users(id)
             )`, (err) => {
                 if (err) console.error('❌ Error creating user_activity_logs table:', err);
-                else console.log('✅ User activity logs table ready');
-                resolve();
+                else {
+                    console.log('✅ User activity logs table ready');
+                    resolve();
+                }
             });
         });
     });
 }
 
 async function createAdminUser() {
-    try {
-        const adminExists = await dbGet(
-            'SELECT id FROM users WHERE username = ? OR email = ?',
-            [CONFIG.ADMIN_USERNAME, CONFIG.ADMIN_EMAIL]
-        );
-
-        if (!adminExists) {
-            const passwordHash = await bcrypt.hash(CONFIG.ADMIN_PASSWORD, 12);
-            await dbRun(
-                'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
-                [CONFIG.ADMIN_USERNAME, CONFIG.ADMIN_EMAIL, passwordHash, 'admin']
+    return new Promise(async (resolve, reject) => {
+        try {
+            const adminExists = await dbGet(
+                'SELECT id FROM users WHERE username = ? OR email = ?',
+                [CONFIG.ADMIN_USERNAME, CONFIG.ADMIN_EMAIL]
             );
-            console.log('✅ Default admin user created');
-        } else {
-            console.log('✅ Admin user already exists');
+
+            if (!adminExists) {
+                const passwordHash = await bcrypt.hash(CONFIG.ADMIN_PASSWORD, 12);
+                await dbRun(
+                    'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
+                    [CONFIG.ADMIN_USERNAME, CONFIG.ADMIN_EMAIL, passwordHash, 'admin']
+                );
+                console.log('✅ Default admin user created');
+            } else {
+                console.log('✅ Admin user already exists');
+            }
+            resolve();
+        } catch (error) {
+            console.error('❌ Error creating admin user:', error);
+            reject(error);
         }
-    } catch (error) {
-        console.error('❌ Error creating admin user:', error);
-    }
+    });
 }
 
 // System Prompts Management
@@ -235,58 +243,76 @@ const SYSTEM_PROMPTS_DIR = './system-prompts';
 let systemPrompts = {};
 let promptCategories = {};
 
-async function initializeSystemPrompts() {
-    try {
-        if (!fs.existsSync(SYSTEM_PROMPTS_DIR)) {
-            console.log('📥 Cloning system prompts repository...');
-            await simpleGit().clone(
-                'https://github.com/x1xhlol/system-prompts-and-models-of-ai-tools',
-                SYSTEM_PROMPTS_DIR,
-                ['--depth', '1']
-            );
-            console.log('✅ System prompts repository cloned successfully.');
-        } else {
-            console.log('✅ System prompts directory already exists');
-            // Update existing repository
-            try {
-                await simpleGit(SYSTEM_PROMPTS_DIR).pull();
-                console.log('✅ System prompts repository updated');
-            } catch (pullError) {
-                console.log('⚠️ Could not update system prompts repository:', pullError.message);
-            }
-        }
-        loadAllPrompts();
-    } catch (error) {
-        console.error('❌ Error initializing system prompts:', error.message);
-        // Create default prompts if repository fails
-        createDefaultSystemPrompts();
-    }
-}
-
+// Create default system prompts if repository fails
 function createDefaultSystemPrompts() {
     console.log('📝 Creating default system prompts...');
     systemPrompts = {
         'general': {
             content: 'You are a helpful, respectful, and honest assistant. Always answer as helpfully as possible.',
             category: 'general',
-            filename: 'general.md'
+            filename: 'general.md',
+            path: 'general'
         },
         'coding': {
-            content: 'You are an expert programming assistant. Help users with code, debugging, and technical questions.',
+            content: 'You are an expert programming assistant. Help users with code, debugging, and technical questions. Provide clear, working code examples and explanations.',
             category: 'coding',
-            filename: 'coding.md'
+            filename: 'coding.md',
+            path: 'coding'
         },
         'writing': {
-            content: 'You are a creative writing assistant. Help users with writing, editing, and creative projects.',
+            content: 'You are a creative writing assistant. Help users with writing, editing, and creative projects. Provide constructive feedback and creative suggestions.',
             category: 'writing',
-            filename: 'writing.md'
+            filename: 'writing.md',
+            path: 'writing'
+        },
+        'analysis': {
+            content: 'You are an analytical assistant. Help users analyze data, understand complex topics, and make informed decisions. Provide clear, logical analysis.',
+            category: 'analysis',
+            filename: 'analysis.md',
+            path: 'analysis'
         }
     };
     promptCategories = {
         'general': ['general'],
         'coding': ['coding'],
-        'writing': ['writing']
+        'writing': ['writing'],
+        'analysis': ['analysis']
     };
+    console.log('✅ Default system prompts created');
+}
+
+async function initializeSystemPrompts() {
+    try {
+        if (!fs.existsSync(SYSTEM_PROMPTS_DIR)) {
+            console.log('📥 Cloning system prompts repository...');
+            try {
+                await simpleGit().clone(
+                    'https://github.com/x1xhlol/system-prompts-and-models-of-ai-tools',
+                    SYSTEM_PROMPTS_DIR,
+                    ['--depth', '1']
+                );
+                console.log('✅ System prompts repository cloned successfully.');
+            } catch (cloneError) {
+                console.error('❌ Failed to clone system prompts repository:', cloneError.message);
+                console.log('🔄 Using default system prompts...');
+                createDefaultSystemPrompts();
+                return;
+            }
+        }
+        
+        // Try to load prompts from repository
+        loadAllPrompts();
+        
+        // If no prompts loaded, create defaults
+        if (Object.keys(systemPrompts).length === 0) {
+            console.log('⚠️ No prompts loaded from repository, using defaults');
+            createDefaultSystemPrompts();
+        }
+        
+    } catch (error) {
+        console.error('❌ Error initializing system prompts:', error.message);
+        createDefaultSystemPrompts();
+    }
 }
 
 function loadAllPrompts() {
@@ -302,56 +328,40 @@ function loadAllPrompts() {
 
         function scanDirectory(dir, category = '') {
             try {
-                const items = fs.readdirSync(dir);
+                const items = fs.readdirSync(dir, { withFileTypes: true });
                 
                 items.forEach(item => {
-                    const fullPath = path.join(dir, item);
+                    const fullPath = path.join(dir, item.name);
                     
-                    try {
-                        const stat = fs.statSync(fullPath);
-                        
-                        if (stat.isDirectory()) {
-                            const newCategory = category ? `${category}/${item}` : item;
+                    if (item.isDirectory()) {
+                        const newCategory = category ? `${category}/${item.name}` : item.name;
+                        if (!promptCategories[newCategory]) {
                             promptCategories[newCategory] = [];
-                            scanDirectory(fullPath, newCategory);
-                        } else if (stat.isFile()) {
-                            if (item.endsWith('.md') || item.endsWith('.txt') || item.endsWith('.json')) {
-                                try {
-                                    const content = fs.readFileSync(fullPath, 'utf8');
-                                    const relativePath = path.relative(SYSTEM_PROMPTS_DIR, fullPath);
-                                    
-                                    let promptData = {
-                                        content: content,
-                                        path: relativePath,
-                                        category: category,
-                                        filename: item,
-                                        fullPath: fullPath
-                                    };
-                                    
-                                    if (item.endsWith('.json')) {
-                                        try {
-                                            const jsonData = JSON.parse(content);
-                                            promptData.json_content = jsonData;
-                                        } catch (e) {
-                                            console.warn(`⚠️ Could not parse JSON file ${fullPath}:`, e.message);
-                                        }
-                                    }
-                                    
-                                    systemPrompts[relativePath] = promptData;
-                                    
-                                    if (category) {
-                                        if (!promptCategories[category]) {
-                                            promptCategories[category] = [];
-                                        }
-                                        promptCategories[category].push(relativePath);
-                                    }
-                                } catch (fileError) {
-                                    console.error(`❌ Error reading file ${fullPath}:`, fileError.message);
+                        }
+                        scanDirectory(fullPath, newCategory);
+                    } else if (item.isFile()) {
+                        if (item.name.endsWith('.md') || item.name.endsWith('.txt')) {
+                            try {
+                                const content = fs.readFileSync(fullPath, 'utf8');
+                                const relativePath = path.relative(SYSTEM_PROMPTS_DIR, fullPath);
+                                
+                                const promptData = {
+                                    content: content,
+                                    path: relativePath,
+                                    category: category,
+                                    filename: item.name,
+                                    fullPath: fullPath
+                                };
+                                
+                                systemPrompts[relativePath] = promptData;
+                                
+                                if (category && !promptCategories[category].includes(relativePath)) {
+                                    promptCategories[category].push(relativePath);
                                 }
+                            } catch (fileError) {
+                                console.error(`❌ Error reading file ${fullPath}:`, fileError.message);
                             }
                         }
-                    } catch (statError) {
-                        console.error(`❌ Error stating ${fullPath}:`, statError.message);
                     }
                 });
             } catch (readdirError) {
@@ -364,116 +374,6 @@ function loadAllPrompts() {
     } catch (error) {
         console.error('❌ Error loading system prompts:', error.message);
         createDefaultSystemPrompts();
-    }
-}
-
-// AI Utility Functions
-async function classifyPromptCategory(userPrompt) {
-    try {
-        const availableCategories = Object.keys(promptCategories);
-        if (availableCategories.length === 0) {
-            return 'general';
-        }
-
-        const promptLower = userPrompt.toLowerCase();
-        
-        // Enhanced category detection
-        const categoryKeywords = {
-            'coding': ['code', 'program', 'python', 'javascript', 'java', 'c++', 'html', 'css', 'function', 'algorithm', 'debug', 'error'],
-            'writing': ['write', 'essay', 'story', 'article', 'blog', 'email', 'letter', 'creative', 'poem', 'novel'],
-            'explanation': ['explain', 'what is', 'how does', 'why', 'meaning', 'define', 'concept'],
-            'math': ['math', 'calculate', 'solve', 'equation', 'formula', 'statistics', 'probability'],
-            'research': ['research', 'study', 'paper', 'thesis', 'academic', 'scholarly'],
-            'business': ['business', 'marketing', 'strategy', 'plan', 'proposal', 'presentation']
-        };
-
-        for (const [category, keywords] of Object.entries(categoryKeywords)) {
-            if (keywords.some(keyword => promptLower.includes(keyword)) && promptCategories[category]) {
-                return category;
-            }
-        }
-
-        return 'general';
-    } catch (error) {
-        console.error('❌ Error classifying prompt:', error.message);
-        return 'general';
-    }
-}
-
-async function selectBestSystemPrompt(userPrompt, category, userId = null) {
-    try {
-        let availablePrompts = promptCategories[category] || [];
-        
-        // Add user's custom prompts for this category
-        if (userId) {
-            const userPrompts = await dbAll(
-                'SELECT name, content FROM user_system_prompts WHERE user_id = ? AND (category = ? OR category = "general") AND is_active = TRUE',
-                [userId, category]
-            );
-            
-            userPrompts.forEach((prompt, index) => {
-                const userPromptId = `user_${prompt.name}_${index}`;
-                systemPrompts[userPromptId] = {
-                    content: prompt.content,
-                    category: category,
-                    filename: prompt.name,
-                    isUserPrompt: true
-                };
-                availablePrompts.push(userPromptId);
-            });
-        }
-
-        if (availablePrompts.length === 0) {
-            // Fallback to general category
-            availablePrompts = promptCategories['general'] || [];
-            if (availablePrompts.length === 0) return null;
-        }
-
-        // Enhanced prompt selection with semantic matching
-        const userPromptLower = userPrompt.toLowerCase();
-        let bestMatch = null;
-        let bestScore = 0;
-
-        for (const promptPath of availablePrompts) {
-            const prompt = systemPrompts[promptPath];
-            let score = 0;
-
-            // Score based on filename/keyword matching
-            const filenameLower = prompt.filename.toLowerCase();
-            
-            // Keyword scoring
-            const keywords = [
-                'code', 'program', 'developer', 'coding',
-                'write', 'writer', 'author', 'writing',
-                'explain', 'explanation', 'teacher',
-                'math', 'calculate', 'mathematics',
-                'creative', 'story', 'blog'
-            ];
-
-            keywords.forEach(keyword => {
-                if (userPromptLower.includes(keyword) && filenameLower.includes(keyword)) {
-                    score += 3;
-                } else if (userPromptLower.includes(keyword) || filenameLower.includes(keyword)) {
-                    score += 1;
-                }
-            });
-
-            // Prefer user prompts for better personalization
-            if (prompt.isUserPrompt) {
-                score += 2;
-            }
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = prompt;
-            }
-        }
-
-        return bestMatch || systemPrompts[availablePrompts[0]];
-    } catch (error) {
-        console.error('❌ Error selecting system prompt:', error.message);
-        const availablePrompts = promptCategories[category] || promptCategories['general'] || [];
-        return availablePrompts.length > 0 ? systemPrompts[availablePrompts[0]] : null;
     }
 }
 
@@ -512,6 +412,90 @@ function dbAll(query, params = []) {
             }
         });
     });
+}
+
+// AI Utility Functions
+async function classifyPromptCategory(userPrompt) {
+    try {
+        const promptLower = userPrompt.toLowerCase();
+        
+        // Enhanced category detection with better keywords
+        const categoryKeywords = {
+            'coding': ['code', 'program', 'python', 'javascript', 'java', 'c++', 'html', 'css', 'function', 'algorithm', 'debug', 'error', 'script', 'develop', 'software'],
+            'writing': ['write', 'essay', 'story', 'article', 'blog', 'email', 'letter', 'creative', 'poem', 'novel', 'content', 'draft'],
+            'analysis': ['analyze', 'analysis', 'research', 'data', 'statistics', 'trend', 'pattern', 'compare', 'evaluate'],
+            'explanation': ['explain', 'what is', 'how does', 'why', 'meaning', 'define', 'concept', 'understand'],
+            'math': ['math', 'calculate', 'solve', 'equation', 'formula', 'statistics', 'probability', 'algebra', 'calculus'],
+            'business': ['business', 'marketing', 'strategy', 'plan', 'proposal', 'presentation', 'sales', 'startup']
+        };
+
+        for (const [category, keywords] of Object.entries(categoryKeywords)) {
+            if (keywords.some(keyword => promptLower.includes(keyword))) {
+                return category;
+            }
+        }
+
+        return 'general';
+    } catch (error) {
+        console.error('❌ Error classifying prompt:', error.message);
+        return 'general';
+    }
+}
+
+async function selectBestSystemPrompt(userPrompt, category, userId = null) {
+    try {
+        let availablePrompts = [];
+        
+        // Add system prompts for the category
+        if (promptCategories[category]) {
+            availablePrompts = [...promptCategories[category]];
+        }
+        
+        // Add user's custom prompts for this category
+        if (userId) {
+            try {
+                const userPrompts = await dbAll(
+                    'SELECT id, name, content, category FROM user_system_prompts WHERE user_id = ? AND is_active = TRUE AND (category = ? OR category = "general")',
+                    [userId, category]
+                );
+                
+                userPrompts.forEach((prompt) => {
+                    const userPromptId = `user_${prompt.id}`;
+                    systemPrompts[userPromptId] = {
+                        content: prompt.content,
+                        category: prompt.category,
+                        filename: prompt.name,
+                        isUserPrompt: true,
+                        userPromptId: prompt.id
+                    };
+                    availablePrompts.push(userPromptId);
+                });
+            } catch (dbError) {
+                console.error('Error fetching user prompts:', dbError);
+            }
+        }
+
+        // Fallback to general category if no prompts found
+        if (availablePrompts.length === 0 && category !== 'general') {
+            availablePrompts = promptCategories['general'] || [];
+        }
+
+        if (availablePrompts.length === 0) {
+            return null;
+        }
+
+        // Simple selection logic - prefer user prompts, then category-specific prompts
+        const userPrompt = availablePrompts.find(p => systemPrompts[p]?.isUserPrompt);
+        if (userPrompt) {
+            return systemPrompts[userPrompt];
+        }
+
+        // Return the first available prompt for the category
+        return systemPrompts[availablePrompts[0]];
+    } catch (error) {
+        console.error('❌ Error selecting system prompt:', error.message);
+        return null;
+    }
 }
 
 // Authentication Middleware
@@ -572,8 +556,11 @@ const requireAdmin = (req, res, next) => {
 };
 
 // Log user activity
-async function logUserActivity(userId, action, ipAddress, userAgent, details = null) {
+async function logUserActivity(userId, action, req, details = null) {
     try {
+        const ipAddress = req.ip || req.connection.remoteAddress;
+        const userAgent = req.get('User-Agent') || 'Unknown';
+        
         await dbRun(
             'INSERT INTO user_activity_logs (user_id, action, ip_address, user_agent, details) VALUES (?, ?, ?, ?, ?)',
             [userId, action, ipAddress, userAgent, details]
@@ -602,8 +589,6 @@ app.get('/api/health', (req, res) => {
 app.post('/api/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
-        const ipAddress = req.ip || req.connection.remoteAddress;
-        const userAgent = req.get('User-Agent');
 
         if (!username || !password) {
             return res.status(400).json({ error: 'Username and password are required' });
@@ -625,7 +610,7 @@ app.post('/api/register', async (req, res) => {
         );
 
         // Log registration activity
-        await logUserActivity(result.lastID, 'register', ipAddress, userAgent);
+        await logUserActivity(result.lastID, 'register', req);
 
         const token = jwt.sign(
             { 
@@ -663,8 +648,6 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { username, password } = req.body;
-        const ipAddress = req.ip || req.connection.remoteAddress;
-        const userAgent = req.get('User-Agent');
 
         if (!username || !password) {
             return res.status(400).json({ error: 'Username and password are required' });
@@ -699,7 +682,7 @@ app.post('/api/login', async (req, res) => {
         );
 
         // Log login activity
-        await logUserActivity(user.id, 'login', ipAddress, userAgent);
+        await logUserActivity(user.id, 'login', req);
 
         const token = jwt.sign(
             { 
@@ -810,10 +793,9 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
         let conversationHistory = [];
         if (conversationId && req.user.role !== 'guest') {
             conversationHistory = await dbAll(
-                'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 10',
+                'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 10',
                 [conversationId]
             );
-            conversationHistory.reverse(); // Oldest first
         }
 
         // Prepare messages with context
@@ -826,7 +808,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
         conversationHistory.forEach(msg => {
             if (msg.role === 'user' && msg.content !== prompt) {
                 messages.push({ role: 'user', content: msg.content });
-            } else if (msg.role === 'ai') {
+            } else if (msg.role === 'assistant') {
                 messages.push({ role: 'assistant', content: msg.content });
             }
         });
@@ -858,47 +840,14 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                 console.log(`✅ Groq response received (${tokensUsed} tokens)`);
             } catch (groqError) {
                 console.error('❌ Groq API error:', groqError.message);
-                
-                // Fallback to Sudoapp if Groq fails
-                if (CONFIG.SUDOAPP_API_KEY && CONFIG.SUDOAPP_API_KEY.length > 10) {
-                    console.log('🔄 Groq failed, falling back to Sudoapp...');
-                    usedFallback = true;
-                    
-                    try {
-                        const response = await fetch(CONFIG.SUDOAPP_API_URL, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': `Bearer ${CONFIG.SUDOAPP_API_KEY}`
-                            },
-                            body: JSON.stringify({
-                                model: 'gpt-4o',
-                                messages: messages,
-                                temperature: 0.7,
-                                max_tokens: 2048
-                            })
-                        });
-
-                        if (!response.ok) {
-                            const errorText = await response.text();
-                            throw new Error(`Sudoapp API error: ${response.status} - ${errorText}`);
-                        }
-
-                        const data = await response.json();
-                        aiResponse = data.choices[0]?.message?.content || 'No response from AI';
-                        tokensUsed = data.usage?.total_tokens || 0;
-                        selectedModel = 'sudoapp';
-                        console.log(`✅ Sudoapp fallback response received (${tokensUsed} tokens)`);
-                    } catch (fallbackError) {
-                        throw new Error(`Both Groq and Sudoapp failed: ${fallbackError.message}`);
-                    }
-                } else {
-                    throw groqError;
-                }
+                usedFallback = true;
             }
-        } else {
-            // Direct to Sudoapp if Groq not available
+        }
+
+        // Fallback to Sudoapp if Groq fails or not available
+        if ((!groqAvailable || usedFallback) && CONFIG.SUDOAPP_API_KEY && CONFIG.SUDOAPP_API_KEY.length > 10) {
             try {
+                console.log('🔄 Using Sudoapp API...');
                 const response = await fetch(CONFIG.SUDOAPP_API_URL, {
                     method: 'POST',
                     headers: {
@@ -906,7 +855,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                         'Authorization': `Bearer ${CONFIG.SUDOAPP_API_KEY}`
                     },
                     body: JSON.stringify({
-                        model: 'gpt-4o',
+                        model: 'gpt-3.5-turbo',
                         messages: messages,
                         temperature: 0.7,
                         max_tokens: 2048
@@ -914,8 +863,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                 });
 
                 if (!response.ok) {
-                    const errorText = await response.text();
-                    throw new Error(`Sudoapp API error: ${response.status} - ${errorText}`);
+                    throw new Error(`Sudoapp API error: ${response.status}`);
                 }
 
                 const data = await response.json();
@@ -923,9 +871,18 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                 tokensUsed = data.usage?.total_tokens || 0;
                 selectedModel = 'sudoapp';
                 console.log(`✅ Sudoapp response received (${tokensUsed} tokens)`);
+                usedFallback = false; // Successfully used Sudoapp
             } catch (sudoappError) {
-                throw new Error(`Sudoapp failed: ${sudoappError.message}`);
+                console.error('❌ Sudoapp API error:', sudoappError.message);
+                usedFallback = true;
             }
+        }
+
+        // If both APIs failed
+        if (usedFallback || !aiResponse) {
+            aiResponse = 'I apologize, but I am currently unable to process your request. Please try again later.';
+            selectedModel = 'fallback';
+            tokensUsed = 0;
         }
 
         // Save AI response to conversation
@@ -936,7 +893,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
                 [
                     conversationId, 
-                    'ai', 
+                    'assistant', 
                     aiResponse, 
                     usedFallback ? `${selectedModel}_fallback` : selectedModel,
                     selectedPromptInfo ? JSON.stringify(selectedPromptInfo) : null,
@@ -957,8 +914,7 @@ app.post('/api/chat', authenticateToken, async (req, res) => {
             await logUserActivity(
                 req.user.userId, 
                 'chat_message', 
-                req.ip, 
-                req.get('User-Agent'),
+                req,
                 `Category: ${promptCategory}, Tokens: ${tokensUsed}`
             );
         }
@@ -1007,25 +963,34 @@ app.post('/api/tts', authenticateToken, async (req, res) => {
 
         const selectedVoice = validVoices.includes(voice) ? voice : 'Arista-PlayAI';
 
-        // Use Groq TTS
-        const ttsResponse = await groq.audio.speech.create({
-            model: "playai-tts",
-            voice: selectedVoice,
-            input: text.substring(0, 5000), // Limit text length
-            speed: 1.0,
-            response_format: "mp3"
-        });
+        try {
+            // Use Groq TTS
+            const ttsResponse = await groq.audio.speech.create({
+                model: "playai-tts",
+                voice: selectedVoice,
+                input: text.substring(0, 5000), // Limit text length
+                speed: 1.0,
+                response_format: "mp3"
+            });
 
-        // Convert response to buffer
-        const audioBuffer = Buffer.from(await ttsResponse.arrayBuffer());
+            // Convert response to buffer
+            const audioBuffer = Buffer.from(await ttsResponse.arrayBuffer());
 
-        res.set({
-            'Content-Type': 'audio/mpeg',
-            'Content-Length': audioBuffer.length,
-            'Content-Disposition': 'inline; filename="tts.mp3"'
-        });
+            res.set({
+                'Content-Type': 'audio/mpeg',
+                'Content-Length': audioBuffer.length,
+                'Content-Disposition': 'inline; filename="tts.mp3"'
+            });
 
-        res.send(audioBuffer);
+            res.send(audioBuffer);
+
+        } catch (ttsError) {
+            console.error('❌ Groq TTS error:', ttsError);
+            return res.status(500).json({ 
+                error: 'Failed to generate speech using Groq TTS',
+                details: ttsError.message
+            });
+        }
 
     } catch (error) {
         console.error('❌ TTS error:', error);
@@ -1047,28 +1012,24 @@ app.post('/api/generate-image', authenticateToken, async (req, res) => {
 
         console.log(`🎨 Generating image for prompt: ${prompt}`);
         
-        const response = await fetch(CONFIG.SEAART_API_URL, {
+        // Using a more reliable image generation API
+        const response = await fetch('https://api.deepai.org/api/text2img', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'api-key': 'quickstart-QUdJIGlzIGNvbWluZy4uLi4K' // Free tier key
             },
-            body: JSON.stringify({
-                prompt: prompt.substring(0, 500),
-                width: 1024,
-                height: 1024,
-                steps: 20,
-                cfg_scale: 7.5
-            })
+            body: `text=${encodeURIComponent(prompt)}`
         });
 
         if (!response.ok) {
-            throw new Error(`SeaArt API error: ${response.status} ${response.statusText}`);
+            throw new Error(`Image generation API error: ${response.status} ${response.statusText}`);
         }
 
         const data = await response.json();
         
-        if (!data.images || !Array.isArray(data.images)) {
-            throw new Error('Invalid response format from SeaArt API');
+        if (!data.output_url) {
+            throw new Error('Invalid response format from image generation API');
         }
 
         // Log image generation activity
@@ -1076,14 +1037,13 @@ app.post('/api/generate-image', authenticateToken, async (req, res) => {
             await logUserActivity(
                 req.user.userId, 
                 'image_generation', 
-                req.ip, 
-                req.get('User-Agent'),
+                req,
                 `Prompt: ${prompt.substring(0, 100)}`
             );
         }
 
         res.json({ 
-            images: data.images,
+            images: [data.output_url],
             prompt: prompt,
             success: true
         });
@@ -1213,9 +1173,19 @@ app.get('/api/system-prompts', authenticateToken, requireAuth, async (req, res) 
             [req.user.userId]
         );
 
+        // Also include system prompts from repository
+        const systemPromptsList = Object.entries(systemPrompts).map(([id, prompt]) => ({
+            id: id,
+            name: prompt.filename,
+            content: prompt.content.substring(0, 200) + '...',
+            category: prompt.category,
+            is_system: true
+        }));
+
         res.json({
             user_prompts: userPrompts,
-            public_prompts: publicPrompts
+            public_prompts: publicPrompts,
+            system_prompts: systemPromptsList
         });
     } catch (error) {
         console.error('❌ System prompts fetch error:', error);
@@ -1314,7 +1284,7 @@ app.get('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
             `SELECT 
                 COUNT(DISTINCT c.id) as total_conversations,
                 COUNT(m.id) as total_messages,
-                SUM(m.tokens_used) as total_tokens,
+                SUM(COALESCE(m.tokens_used, 0)) as total_tokens,
                 COUNT(DISTINCT m.prompt_category) as categories_used
              FROM conversations c
              LEFT JOIN messages m ON c.id = m.conversation_id
@@ -1336,7 +1306,12 @@ app.get('/api/user/profile', authenticateToken, requireAuth, async (req, res) =>
                 theme: user.theme,
                 language: user.language
             },
-            stats: stats || { total_conversations: 0, total_messages: 0, total_tokens: 0, categories_used: 0 }
+            stats: {
+                total_conversations: stats?.total_conversations || 0,
+                total_messages: stats?.total_messages || 0,
+                total_tokens: stats?.total_tokens || 0,
+                categories_used: stats?.categories_used || 0
+            }
         });
     } catch (error) {
         console.error('❌ Get profile error:', error);
@@ -1351,7 +1326,7 @@ app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =>
             `SELECT u.id, u.username, u.email, u.role, u.banned, u.ban_reason, u.banned_at, u.created_at, u.last_login,
                     COUNT(DISTINCT c.id) as conversation_count, 
                     COUNT(m.id) as message_count,
-                    SUM(m.tokens_used) as total_tokens
+                    SUM(COALESCE(m.tokens_used, 0)) as total_tokens
              FROM users u
              LEFT JOIN conversations c ON u.id = c.user_id AND c.is_active = TRUE
              LEFT JOIN messages m ON c.id = m.conversation_id
@@ -1371,15 +1346,9 @@ app.get('/api/admin/user/:id/details', authenticateToken, requireAdmin, async (r
         const userId = req.params.id;
 
         const user = await dbGet(
-            `SELECT u.*, 
-                    COUNT(DISTINCT c.id) as conversation_count,
-                    COUNT(m.id) as message_count,
-                    SUM(m.tokens_used) as total_tokens
+            `SELECT u.*
              FROM users u
-             LEFT JOIN conversations c ON u.id = c.user_id AND c.is_active = TRUE
-             LEFT JOIN messages m ON c.id = m.conversation_id
-             WHERE u.id = ?
-             GROUP BY u.id`,
+             WHERE u.id = ?`,
             [userId]
         );
 
@@ -1390,7 +1359,7 @@ app.get('/api/admin/user/:id/details', authenticateToken, requireAdmin, async (r
         const conversations = await dbAll(
             `SELECT c.id, c.title, c.created_at, c.updated_at,
                     COUNT(m.id) as message_count,
-                    SUM(m.tokens_used) as tokens_used
+                    SUM(COALESCE(m.tokens_used, 0)) as tokens_used
              FROM conversations c
              LEFT JOIN messages m ON c.id = m.conversation_id
              WHERE c.user_id = ? AND c.is_active = TRUE
@@ -1458,8 +1427,7 @@ app.post('/api/admin/users/:id/ban', authenticateToken, requireAdmin, async (req
         await logUserActivity(
             req.user.userId, 
             'ban_user', 
-            req.ip, 
-            req.get('User-Agent'),
+            req,
             `Banned user: ${user.username}, Reason: ${reason}`
         );
 
@@ -1511,8 +1479,7 @@ app.post('/api/admin/users/:id/unban', authenticateToken, requireAdmin, async (r
         await logUserActivity(
             req.user.userId, 
             'unban_user', 
-            req.ip, 
-            req.get('User-Agent'),
+            req,
             `Unbanned user: ${user.username}`
         );
 
@@ -1536,7 +1503,7 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
         const bannedUsers = await dbGet('SELECT COUNT(*) as count FROM users WHERE banned = TRUE');
         const totalConversations = await dbGet('SELECT COUNT(*) as count FROM conversations WHERE is_active = TRUE');
         const totalMessages = await dbGet('SELECT COUNT(*) as count FROM messages');
-        const totalTokens = await dbGet('SELECT SUM(tokens_used) as count FROM messages');
+        const totalTokens = await dbGet('SELECT SUM(COALESCE(tokens_used, 0)) as count FROM messages');
         
         const activeUsers = await dbGet(`
             SELECT COUNT(DISTINCT user_id) as count 
@@ -1570,15 +1537,15 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
         `);
 
         res.json({
-            totalUsers: totalUsers.count,
-            bannedUsers: bannedUsers.count,
-            totalConversations: totalConversations.count,
-            totalMessages: totalMessages.count,
-            totalTokens: totalTokens.count || 0,
-            activeUsers: activeUsers.count,
-            popularCategories: popularCategories,
-            modelUsage: modelUsage,
-            recentActivity: recentActivity
+            totalUsers: totalUsers?.count || 0,
+            bannedUsers: bannedUsers?.count || 0,
+            totalConversations: totalConversations?.count || 0,
+            totalMessages: totalMessages?.count || 0,
+            totalTokens: totalTokens?.count || 0,
+            activeUsers: activeUsers?.count || 0,
+            popularCategories: popularCategories || [],
+            modelUsage: modelUsage || [],
+            recentActivity: recentActivity || []
         });
     } catch (error) {
         console.error('❌ Admin stats error:', error);
@@ -1589,7 +1556,7 @@ app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) =>
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
-        message: '🤖 aifromearth - Advanced AI Chatting Application Server',
+        message: '🤖 NeuroAI - Advanced AI Chatting Application Server',
         version: '3.0.0',
         status: 'running',
         features: [
@@ -1647,7 +1614,7 @@ app.use((error, req, res, next) => {
 // Initialize and start server
 async function startServer() {
     try {
-        console.log('🚀 Starting Enhanced aifromearth Chat Server...');
+        console.log('🚀 Starting Enhanced NeuroAI Chat Server...');
         
         await initializeSystemPrompts();
         
